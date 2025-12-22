@@ -1,10 +1,10 @@
-    import os
-import requests
-import logging
+import os
 import ccxt
-import threading
 import time
-from datetime import datetime, timezone, timedelta
+import logging
+import requests
+import threading
+from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ===================== LOGGING =====================
@@ -14,239 +14,213 @@ logging.basicConfig(
 )
 logger = logging.getLogger("quantis")
 
-# ===================== CONFIG =====================
-SYMBOLS = ["ZEC/USDT", "SOL/USDT"]
-TRADE_START_HOUR_GMT = 9   # Heure début trading (GMT = Abidjan)
+# ===================== CONFIG DYNAMIQUE =====================
+SYMBOLS = ["ZEC/USDT", "SOL/USDT", "ETH/USDT", "DOGE/USDT", "BTC/USDT"]
+MAX_ACTIVE_PAIRS = 2 # Quantis se concentre sur les 2 premières
+TRADE_START_HOUR_GMT = 9
 TRADE_END_HOUR_GMT = 22
 TRADE_MINUTE_WINDOW = 2
 MIN_CONFLUENCE_SCORE = 85
+USE_LIMIT_ORDER = True  # True pour 'limit', False pour 'market'
 
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-THREE_COMMAS_WEBHOOK_URL = os.getenv("THREE_COMMAS_WEBHOOK_URL")
-BOT_ID_ZEC = os.getenv("BOT_ID_ZEC")
-BOT_ID_SOL = os.getenv("BOT_ID_SOL")
-SECRET_TOKEN_3C = os.getenv("SECRET_TOKEN_3C")
+WUNDERTRADE_WEBHOOK_URL = os.getenv("WUNDERTRADE_WEBHOOK_URL")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# ===================== TECHNICAL ANALYZER =====================
+# ===================== TECHNICAL ANALYZER (7+ INDICATORS) =====================
 class TechnicalAnalyzer7:
-    """
-    Analyse technique avec 7 indicateurs : RSI, MACD, EMA, SMA, Bollinger, ATR, Ichimoku (simplifié)
-    """
-
     def __init__(self, exchange):
         self.exchange = exchange
 
-    def analyze_7_indicators(self, symbol: str, timeframe: str):
+    def analyze_indicators(self, symbol: str, timeframe="1d"):
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
             closes = [c[4] for c in ohlcv]
             highs = [c[2] for c in ohlcv]
             lows = [c[3] for c in ohlcv]
 
-            # --- RSI ---
+            # RSI & MACD
             rsi = self._rsi(closes)
-
-            # --- EMA ---
-            ema20 = sum(closes[-20:])/20
-
-            # --- SMA ---
-            sma50 = sum(closes[-50:])/50
-
-            # --- MACD (simplifié) ---
             ema12 = sum(closes[-12:])/12
             ema26 = sum(closes[-26:])/26
             macd = ema12 - ema26
-
-            # --- Bollinger (simplifié) ---
+            
+            # MOYENNES
+            ema20 = sum(closes[-20:])/20
+            sma50 = sum(closes[-50:])/50
+            
+            # BOLLINGER BANDS
             sma20 = sum(closes[-20:])/20
             std20 = (sum([(x-sma20)**2 for x in closes[-20:]])/20)**0.5
-            upper_band = sma20 + 2*std20
-            lower_band = sma20 - 2*std20
-
-            # --- ATR ---
+            upper_band = sma20 + (2 * std20)
+            lower_band = sma20 - (2 * std20)
+            
+            # ATR & ICHIMOKU
             atr = max(highs[-14:]) - min(lows[-14:])
-            atr_percent = atr / closes[-1] * 100
-
-            # --- Ichimoku simplifié ---
+            atr_percent = (atr / closes[-1]) * 100
             tenkan = (max(highs[-9:]) + min(lows[-9:]))/2
             kijun = (max(highs[-26:]) + min(lows[-26:]))/2
-            ichimoku_trend = "bullish" if tenkan > kijun else "bearish"
 
-            # Confluence : score indicateur (placeholder)
-            confluence_score = 90
-
-            # Détermination de la tendance globale
-            trend_votes = 0
-            trend_votes += 1 if rsi>50 else -1
-            trend_votes += 1 if macd>0 else -1
-            trend_votes += 1 if closes[-1]>ema20 else -1
-            trend_votes += 1 if closes[-1]>sma50 else -1
-            trend_votes += 1 if closes[-1]>sma20 else -1
-            trend_votes += 1 if closes[-1]>upper_band else -1
-            trend_votes += 1 if ichimoku_trend=="bullish" else -1
-            trend = "bullish" if trend_votes>0 else "bearish"
+            # SCORE DE CONFLUENCE (Calcul sur 100)
+            votes = 0
+            votes += 15 if rsi > 50 else -15
+            votes += 15 if macd > 0 else -15
+            votes += 10 if closes[-1] > ema20 else -10
+            votes += 10 if closes[-1] > sma50 else -10
+            votes += 15 if tenkan > kijun else -15
+            votes += 15 if closes[-1] > sma20 else -10 # Position / milieu Bollinger
+            
+            confluence_score = abs(votes) + 20 # Base + technique
 
             return {
                 "price": closes[-1],
-                "trend": {"direction": trend},
-                "volatility": {"atr_percent": atr_percent},
+                "direction": "bullish" if votes > 0 else "bearish",
+                "atr_percent": atr_percent,
                 "confluence_score": confluence_score,
-                "indicators": {
-                    "RSI": rsi,
-                    "MACD": macd,
-                    "EMA20": ema20,
-                    "SMA50": sma50,
-                    "Bollinger_upper": upper_band,
-                    "Bollinger_lower": lower_band,
-                    "Ichimoku": ichimoku_trend
-                }
+                "bands": {"upper": upper_band, "lower": lower_band}
             }
-
         except Exception as e:
-            logger.error(f"Erreur TechnicalAnalyzer7: {e}")
-            return {"price": 0, "trend":{"direction":"neutral"}, "volatility":{"atr_percent":1}, "confluence_score":0}
+            logger.error(f"Erreur Analyse: {e}")
+            return None
 
     def _rsi(self, closes, period=14):
-        if len(closes) < period:
-            return 50
+        if len(closes) < period: return 50
         deltas = [closes[i+1]-closes[i] for i in range(len(closes)-1)]
-        seed = deltas[:period]
-        up = sum([x for x in seed if x>0])/period
-        down = -sum([x for x in seed if x<0])/period
+        up = sum([x for x in deltas[:period] if x > 0]) / period
+        down = -sum([x for x in deltas[:period] if x < 0]) / period
         return 100 - 100/(1 + up/down if down != 0 else 1)
 
-# ===================== ORDERBOOK =====================
-class OrderBookAnalyzer:
-    def __init__(self, exchange):
-        self.exchange = exchange
+# ===================== SENTIMENT & ORDERBOOK =====================
+class SentimentWhaleAnalyzer:
+    def analyze(self, symbol):
+        # Simulation d'analyse Whale/Sentiment (Peut être lié à Whale Alert API)
+        return {"bias": "neutral", "whale_movement": False}
 
-    def analyze_orderbook(self, symbol: str):
+class OrderBookAnalyzer:
+    def __init__(self, exchange): self.exchange = exchange
+    def analyze(self, symbol):
         try:
             ob = self.exchange.fetch_order_book(symbol)
             imbalance = sum([b[1] for b in ob['bids'][:5]]) - sum([a[1] for a in ob['asks'][:5]])
-            pressure = "buy" if imbalance > 0 else "sell"
-            return {"imbalance": imbalance, "pressure": pressure}
-        except:
-            return {"imbalance":0, "pressure":"neutral"}
+            return "buy" if imbalance > 0 else "sell"
+        except: return "neutral"
 
-# ===================== SENTIMENT =====================
-class SentimentWhaleAnalyzer:
-    def analyze_sentiment_whales(self, symbol: str):
-        return {"score":0, "bias":"neutral"}
-
-# ===================== SIGNAL GENERATOR =====================
-class CompleteSignalGenerator:
+# ===================== ENGINE QUANTIS =====================
+class QuantisEngine:
     def __init__(self):
-        self.exchange = ccxt.bybit({
-            "apiKey": BYBIT_API_KEY,
-            "secret": BYBIT_API_SECRET,
-            "enableRateLimit": True,
-            "options": {"defaultType": "linear"}
-        })
+        self.exchange = ccxt.bybit({"apiKey": BYBIT_API_KEY, "secret": BYBIT_API_SECRET, "enableRateLimit": True})
         self.tech = TechnicalAnalyzer7(self.exchange)
-        self.orderbook = OrderBookAnalyzer(self.exchange)
-        self.sentiment = SentimentWhaleAnalyzer()
+        self.ob = OrderBookAnalyzer(self.exchange)
+        self.sent = SentimentWhaleAnalyzer()
         self.active_trades = {}
 
-    def _calculate_price_levels(self, tech):
-        atr = tech["volatility"]["atr_percent"]
-        entry = tech["price"]
+    def _get_levels(self, data):
+        price = data["price"]
+        atr = data["atr_percent"]
         return {
-            "entry_price": entry,
-            "tp_percent": round(atr*2,2),
-            "sl_percent": round(atr*1,2),
-            "trailing_stop": {"enabled": True, "callback_percent": round(atr*0.5,2)}
+            "entry": price,
+            "tp": round(atr * 2, 2),
+            "sl": round(atr * 1, 2),
+            "ts": round(atr * 0.5, 2)
         }
 
-    def _determine_direction(self, tech, orderbook, sentiment):
-        if tech["trend"]["direction"]=="bullish" and orderbook["pressure"]=="buy":
-            return "LONG"
-        if tech["trend"]["direction"]=="bearish" and orderbook["pressure"]=="sell":
-            return "SHORT"
-        return "HOLD"
-
-    def send_to_3commas(self, signal):
-        symbol_clean = signal["symbol"].replace("/","")
-        bot_id = BOT_ID_ZEC if "ZEC" in symbol_clean else BOT_ID_SOL
-        action = "buy" if signal["direction"]=="LONG" else "sell"
+    def send_to_wunder(self, symbol, action, direction=None, levels=None):
         payload = {
-            "message_type":"bot",
-            "bot_id":bot_id,
-            "email_token":SECRET_TOKEN_3C,
-            "delay_seconds":0,
-            "pair": f"USDT_{symbol_clean.replace('USDT','')}",
-            "action": action,
-            "take_profit": signal["price_levels"]["tp_percent"],
-            "stop_loss": signal["price_levels"]["sl_percent"],
-            "trailing_enabled": True,
-            "trailing_deviation": signal["price_levels"]["trailing_stop"]["callback_percent"]
+            "action": action, # 'buy', 'sell' ou 'exit'
+            "pair": symbol.replace("/", ""),
+            "order_type": "limit" if USE_LIMIT_ORDER and action != "exit" else "market"
         }
+        if levels:
+            payload.update({
+                "direction": direction.lower(),
+                "entry_price": levels["entry"],
+                "take_profit": levels["tp"],
+                "stop_loss": levels["sl"],
+                "trailing_stop": levels["ts"]
+            })
         try:
-            r = requests.post(THREE_COMMAS_WEBHOOK_URL, json=payload, timeout=5)
-            logger.info(f"3Commas webhook: {r.status_code} {r.text}")
-        except Exception as e:
-            logger.error(f"Erreur 3Commas: {e}")
+            requests.post(WUNDERTRADE_WEBHOOK_URL, json=payload, timeout=5)
+        except Exception as e: logger.error(f"Wunder Error: {e}")
 
-    def _check_retracement_alert(self, symbol, current_price):
+    def monitor_retracement(self, symbol, current_price):
         trade = self.active_trades.get(symbol)
-        if trade:
-            entry = trade["entry_price"]
-            direction = trade["direction"]
-            profit = round((current_price-entry)/entry*100,2)
-            if direction=="LONG" and current_price < entry*0.995:
-                logger.warning(f"⚠️ Retracement détecté LONG {symbol}. Profit actuel : {profit}%")
-            if direction=="SHORT" and current_price > entry*1.005:
-                logger.warning(f"⚠️ Retracement détecté SHORT {symbol}. Profit actuel : {profit}%")
+        if not trade: return
+        
+        entry = trade["entry"]
+        diff = ((current_price - entry) / entry) * 100
+        profit = round(diff if trade["direction"] == "LONG" else -diff, 2)
 
-    def generate_complete_signal(self, symbol):
-        tech = self.tech.analyze_7_indicators(symbol, "1h")
-        ob = self.orderbook.analyze_orderbook(symbol)
-        sent = self.sentiment.analyze_sentiment_whales(symbol)
-        direction = self._determine_direction(tech, ob, sent)
-        price_levels = self._calculate_price_levels(tech)
-        current_price = tech["price"]
+        # Seuil de retracement : 0.5% contre nous
+        if (trade["direction"] == "LONG" and current_price < entry * 0.995) or \
+           (trade["direction"] == "SHORT" and current_price > entry * 1.005):
+            
+            logger.warning(f"Sortie d'urgence {symbol} | PnL: {profit}%")
+            self.send_to_wunder(symbol, action="exit")
+            send_discord_alert({"symbol": symbol, "direction": trade["direction"], "levels": trade}, "retracement", profit)
+            del self.active_trades[symbol]
 
-        self._check_retracement_alert(symbol, current_price)
+    def process(self, symbol):
+        data = self.tech.analyze_indicators(symbol)
+        if not data: return
+        
+        pressure = self.ob.analyze(symbol)
+        sentiment = self.sent.analyze(symbol)
+        
+        # LOGIQUE DE DÉCISION
+        direction = "HOLD"
+        if data["direction"] == "bullish" and pressure == "buy" and sentiment["bias"] != "sell":
+            direction = "LONG"
+        elif data["direction"] == "bearish" and pressure == "sell" and sentiment["bias"] != "buy":
+            direction = "SHORT"
 
+        self.monitor_retracement(symbol, data["price"])
+        
         now = datetime.now(timezone.utc)
-        signal = {
-            "symbol": symbol,
-            "direction": direction,
-            "price_levels": price_levels,
-            "confluence_score": tech["confluence_score"],
-            "indicators": tech["indicators"]
-        }
+        if (direction != "HOLD" and symbol not in self.active_trades and 
+            data["confluence_score"] >= MIN_CONFLUENCE_SCORE and
+            TRADE_START_HOUR_GMT <= now.hour <= TRADE_END_HOUR_GMT and
+            now.minute <= TRADE_MINUTE_WINDOW):
+            
+            levels = self._get_levels(data)
+            self.send_to_wunder(symbol, action=direction.lower(), direction=direction, levels=levels)
+            send_discord_alert({"symbol": symbol, "direction": direction, "levels": levels}, "entry")
+            self.active_trades[symbol] = {"direction": direction, **levels}
 
-        if (
-            TRADE_START_HOUR_GMT <= now.hour <= TRADE_END_HOUR_GMT
-            and direction != "HOLD"
-            and tech["confluence_score"] >= MIN_CONFLUENCE_SCORE
-            and now.minute <= TRADE_MINUTE_WINDOW
-        ):
-            logger.info(f"🚀 Signal {symbol} validé {direction}")
-            self.send_to_3commas(signal)
-            self.active_trades[symbol] = {"direction":direction, "entry_price":current_price}
+# ===================== DISCORD & FLASK =====================
+def send_discord_alert(signal, alert_type, profit=0):
+    lv = signal.get("levels", {})
+    order_mode = "LIMIT" if USE_LIMIT_ORDER else "MARKET"
+    
+    emoji = "🚀" if alert_type == "entry" else "⚠️"
+    msg = (f"{emoji} **QUANTIS {alert_type.upper()}**\n"
+           f"Paire: {signal['symbol']} ({order_mode})\n"
+           f"Direction: {signal['direction']}\n"
+           f"Entrée: {lv.get('entry')}\n"
+           f"TP: {lv.get('tp')}% | SL: {lv.get('sl')}% | TS: {lv.get('ts')}%")
+    
+    if alert_type == "retracement":
+        msg += f"\n**PnL à la sortie: {profit}%**"
+        
+    if DISCORD_WEBHOOK_URL:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
-        return signal
 
-# ===================== FLASK + LOOP =====================
+
 app = Flask(__name__)
-engine = CompleteSignalGenerator()
+quantis = QuantisEngine()
 
 @app.route("/health")
-def health():
-    return jsonify({"status":"running"}), 200
+def health(): return jsonify({"status": "active"}), 200
 
-def trading_loop():
+def run_loop():
     while True:
-        for s in SYMBOLS:
-            try:
-                engine.generate_complete_signal(s)
-            except Exception as e:
-                logger.error(f"Erreur loop: {e}")
+        # On ne traite que les paires configurées dans MAX_ACTIVE_PAIRS
+        for s in SYMBOLS[:MAX_ACTIVE_PAIRS]:
+            try: quantis.process(s)
+            except Exception as e: logger.error(f"Error: {e}")
         time.sleep(30)
 
-if __name__=="__main__":
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT",8080))), daemon=True).start()
-    trading_loop()        
+if __name__ == "__main__":
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080))), daemon=True).start()
+    run_loop()
