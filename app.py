@@ -123,9 +123,9 @@ class QuantisFinal:
             'ts': ts_activation    
         }    
 
-        # Calcul TP/SL/TS en pourcentage
-        tp_pct = round((tp - limit_price) / limit_price * 100, 2)
-        sl_pct = round((sl - limit_price) / limit_price * 100, 2)
+        # Calcul TP/SL/TS en pourcentage AVEC CORRECTION ABS()
+        tp_pct = round(abs(tp - limit_price) / limit_price * 100, 2)
+        sl_pct = round(abs(sl - limit_price) / limit_price * 100, 2)
         ts_pct = round(ts_activation / limit_price * 100, 2)
 
         msg = (f"🎯 **ORDRE LIMITE {side} 1J ({symbol})**\n"    
@@ -152,9 +152,9 @@ class QuantisFinal:
     def send_to_wunder(self, symbol, action, entry, tp, sl, ts):    
         if not WUNDERTRADE_WEBHOOK: return    
 
-        # Conversion en pourcentage par rapport au prix d'entrée
-        tp_pct = round((tp - entry) / entry * 100, 2)
-        sl_pct = round((sl - entry) / entry * 100, 2)
+        # Conversion en pourcentage par rapport au prix d'entrée AVEC CORRECTION ABS()
+        tp_pct = round(abs(tp - entry) / entry * 100, 2)
+        sl_pct = round(abs(sl - entry) / entry * 100, 2)
         ts_pct = round(ts / entry * 100, 2)
 
         payload = {    
