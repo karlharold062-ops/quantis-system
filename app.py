@@ -81,16 +81,20 @@ class QuantisFinal:
                 continue
 
             if symbol in self.active_trades:
-                # Bloc de surveillance modifié pour activer exit_trade_with_retracement
                 self.exit_trade_with_retracement(symbol)
                 continue
 
             safety_ok = self.check_external_safety(symbol)
             book_pressure = self.analyze_order_book(symbol)
 
-            if data_1d['direction'] == "bullish" and safety_ok and book_pressure == "buy":
+            # --- Confirmation 1H avant entrée ---
+            data_1h = self.get_indicators(symbol, '1h')
+            if not data_1h:
+                continue
+
+            if data_1d['direction'] == "bullish" and data_1h['direction'] == "bullish" and safety_ok and book_pressure == "buy":
                 self.enter_trade(symbol, data_1d, "LONG")
-            elif data_1d['direction'] == "bearish" and safety_ok and book_pressure == "sell":
+            elif data_1d['direction'] == "bearish" and data_1h['direction'] == "bearish" and safety_ok and book_pressure == "sell":
                 self.enter_trade(symbol, data_1d, "SHORT")
 
     def enter_trade(self, symbol, data, side):
@@ -166,8 +170,9 @@ class QuantisFinal:
         """
         Sortie intelligente avec :
         1. Filtre de clôture sur la bougie 1H
-        2. Buffer de sécurité autour du VWAP
+        2. Buffer dynamique basé sur ATR
         3. Sortie partielle pour sécuriser profit
+        4. Trailing stop pour la position restante
         """
         if symbol not in self.active_trades:
             return
@@ -176,13 +181,16 @@ class QuantisFinal:
         side = trade['dir']
         entry = trade['entry']
 
-        # --- 1. Filtre de clôture (1H) ---
+        # --- 1. Filtre 1H ---
         data_1h = self.get_indicators(symbol, '1h')
+        if not data_1h:
+            return
         price_close = data_1h['price']
         vwap_1h = data_1h['vwap']
+        atr_1h = data_1h['atr']
 
-        # --- 2. Buffer de sécurité ---
-        buffer = 0.002  # 0.2%
+        # --- 2. Buffer dynamique ---
+        buffer = max(0.002, atr_1h / price_close)
         if side == "LONG" and price_close > vwap_1h * (1 - buffer):
             return
         if side == "SHORT" and price_close < vwap_1h * (1 + buffer):
@@ -190,7 +198,7 @@ class QuantisFinal:
 
         # --- 3. Sortie partielle ---
         pnl_pct_full = round((price_close - entry) / entry * 100, 2) if side == "LONG" else round((entry - price_close) / entry * 100, 2)
-        pnl_pct_partial = pnl_pct_full / 2  # 50% sécurisés
+        pnl_pct_partial = pnl_pct_full / 2
 
         self.send_to_wunder(
             symbol,
@@ -201,14 +209,17 @@ class QuantisFinal:
             trade['ts']
         )
 
-        # Stop loss de la position restante à break-even
-        trade['sl'] = entry
+        # --- 4. Trailing stop pour le reste ---
+        if side == "LONG":
+            trade['sl'] = max(trade['sl'], price_close - atr_1h)
+        else:
+            trade['sl'] = min(trade['sl'], price_close + atr_1h)
 
         self.send_notif(
             f"💰 **SORTIE PARTIELLE ({symbol})**\n"
             f"Prix actuel: {price_close}\n"
             f"Profit sécurisé: {pnl_pct_partial}%\n"
-            f"Stop de la position restante placé à break-even"
+            f"Stop de la position restante ajusté avec trailing ATR"
         )
     # ==========================================================
 
