@@ -24,6 +24,7 @@ END_HOUR = 22
 WHALE_API_KEY = os.getenv("WHALE_ALERT_KEY")
 CP_API_KEY = os.getenv("CRYPTOPANIC_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+WUNDERTRADE_WEBHOOK = os.getenv("WUNDERTRADE_WEBHOOK_URL")  # <--- AJOUT
 
 class QuantisFinal:
     def __init__(self):
@@ -128,9 +129,12 @@ class QuantisFinal:
                f"Entrée (VWAP): {limit_price}\n"
                f"TP: {round(tp, 4)} | SL: {round(sl, 4)}")
         self.send_notif(msg)
+        self.send_to_wunder(symbol, side, limit_price, tp, sl, ts_activation)  # <--- AJOUT
 
     def exit_trade(self, symbol, reason):
         if symbol in self.active_trades:
+            trade = self.active_trades[symbol]
+            self.send_to_wunder(symbol, "exit", trade['entry'], trade['tp'], trade['sl'], trade['ts'])  # <--- AJOUT
             del self.active_trades[symbol]
             self.send_notif(f"⚠️ **SORTIE D'URGENCE ({symbol})**\nRaison: {reason}")
 
@@ -139,6 +143,23 @@ class QuantisFinal:
         if DISCORD_WEBHOOK and "http" in DISCORD_WEBHOOK:
             try: requests.post(DISCORD_WEBHOOK, json={"content": msg})
             except: pass
+
+    # ====== NOUVELLE FONCTION POUR WUNDERTRADING ======
+    def send_to_wunder(self, symbol, action, entry, tp, sl, ts):
+        if not WUNDERTRADE_WEBHOOK: return
+        payload = {
+            "action": action.lower(),  # buy, sell, exit
+            "pair": symbol.replace("/", ""),
+            "order_type": "limit" if action.lower() != "exit" else "market",
+            "entry_price": entry,
+            "take_profit": tp,
+            "stop_loss": sl,
+            "trailing_stop": ts
+        }
+        try:
+            requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=5)
+        except Exception as e:
+            print(f"Erreur WunderTrading: {e}")
 
 # ===================== DÉMARRAGE =====================
 quantis = QuantisFinal()
