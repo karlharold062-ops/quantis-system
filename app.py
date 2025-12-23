@@ -138,7 +138,7 @@ class QuantisFinal:
             del self.active_trades[symbol]
             self.send_notif(f"⚠️ **SORTIE D'URGENCE ({symbol})**\nRaison: {reason}")
 
-    # ========== AJOUT SEULEMENT : SORTIE RETRACEMENT ==========
+    # ================== AJOUT : SORTIE RETRACEMENT ==================
     def exit_trade_market_capture(self, symbol, reason):
         trade = self.active_trades[symbol]
         current_price = self.get_indicators(symbol, '1h')['price']
@@ -165,6 +165,55 @@ class QuantisFinal:
             f"💰 **SORTIE RETRACEMENT ({symbol})**\n"
             f"Raison: {reason}\n"
             f"Profit marché: {pnl_pct}%"
+        )
+
+    def exit_trade_with_retracement(self, symbol):
+        """
+        Sortie intelligente avec :
+        1. Filtre de clôture sur la bougie 1H
+        2. Buffer de sécurité autour du VWAP
+        3. Sortie partielle pour sécuriser profit
+        """
+        if symbol not in self.active_trades:
+            return
+
+        trade = self.active_trades[symbol]
+        side = trade['dir']
+        entry = trade['entry']
+
+        # --- 1. Filtre de clôture (1H) ---
+        data_1h = self.get_indicators(symbol, '1h')
+        price_close = data_1h['price']
+        vwap_1h = data_1h['vwap']
+
+        # --- 2. Buffer de sécurité ---
+        buffer = 0.002  # 0.2%
+        if side == "LONG" and price_close > vwap_1h * (1 - buffer):
+            return
+        if side == "SHORT" and price_close < vwap_1h * (1 + buffer):
+            return
+
+        # --- 3. Sortie partielle ---
+        pnl_pct_full = round((price_close - entry) / entry * 100, 2) if side == "LONG" else round((entry - price_close) / entry * 100, 2)
+        pnl_pct_partial = pnl_pct_full / 2  # 50% sécurisés
+
+        self.send_to_wunder(
+            symbol,
+            "partial_exit",
+            entry,
+            trade['tp'],
+            trade['sl'],
+            trade['ts']
+        )
+
+        # Stop loss de la position restante à break-even
+        trade['sl'] = entry
+
+        self.send_notif(
+            f"💰 **SORTIE PARTIELLE ({symbol})**\n"
+            f"Prix actuel: {price_close}\n"
+            f"Profit sécurisé: {pnl_pct_partial}%\n"
+            f"Stop de la position restante placé à break-even"
         )
     # ==========================================================
 
