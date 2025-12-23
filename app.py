@@ -7,7 +7,16 @@ from datetime import datetime
 import pytz
 
 # ===================== CONFIGURATION QUANTIS PRO =====================
-SYMBOLS = ["ZEC/USDT", "ETH/USDT"] 
+# Choisis ici les paires à surveiller
+# 1 paire seule : ZEC
+# SYMBOLS = ["ZEC/USDT"]
+
+# 1 paire seule : ETH
+# SYMBOLS = ["ETH/USDT"]
+
+# 2 paires : ZEC + ETH
+SYMBOLS = ["ZEC/USDT", "ETH/USDT"]
+
 TIMEZONE = pytz.timezone("Africa/Abidjan") 
 START_HOUR = 13
 END_HOUR = 22
