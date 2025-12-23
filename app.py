@@ -81,13 +81,8 @@ class QuantisFinal:
                 continue
 
             if symbol in self.active_trades:
-                data_1h = self.get_indicators(symbol, '1h')
-                side = self.active_trades[symbol]['dir']
-
-                if side == "LONG" and data_1h['direction'] == "bearish":
-                    self.exit_trade(symbol, "Retournement MTF (Prix < VWAP 1H)")
-                elif side == "SHORT" and data_1h['direction'] == "bullish":
-                    self.exit_trade(symbol, "Retournement MTF (Prix > VWAP 1H)")
+                # Bloc de surveillance modifié pour activer exit_trade_with_retracement
+                self.exit_trade_with_retracement(symbol)
                 continue
 
             safety_ok = self.check_external_safety(symbol)
