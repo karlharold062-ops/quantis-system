@@ -30,12 +30,33 @@ WUNDERTRADE_WEBHOOK = os.getenv("WUNDERTRADE_WEBHOOK_URL")
 
 class QuantisFinal:
     def __init__(self):
+        # --- CORRECTION 1: Validation Sécurité ---
+        self.validate_environment()
+        
         self.exchange = ccxt.bybit({
             'apiKey': os.getenv("BYBIT_API_KEY"),
             'secret': os.getenv("BYBIT_API_SECRET"),
             'enableRateLimit': True
         })
         self.active_trades = {}
+        
+        # --- CORRECTION 2: Paramètres Circuit Breaker ---
+        self.error_count = 0
+        self.max_errors = 5
+        self.circuit_open = False
+
+    def validate_environment(self):
+        """Vérifie la présence des clés essentielles avant de démarrer"""
+        required = ["BYBIT_API_KEY", "BYBIT_API_SECRET", "WUNDERTRADE_WEBHOOK"]
+        missing = [var for var in required if not os.getenv(var)]
+        if missing:
+            msg = f"❌ ERREUR CRITIQUE: Variables manquantes : {missing}"
+            print(msg)
+            # On envoie une notif si possible avant de crash
+            if DISCORD_WEBHOOK:
+                try: requests.post(DISCORD_WEBHOOK, json={"content": msg})
+                except: pass
+            raise EnvironmentError(msg)
 
     def get_indicators(self, symbol, timeframe='1d'):
         try:
@@ -65,9 +86,17 @@ class QuantisFinal:
             return None
 
     def check_external_safety(self, symbol):
-        whale_risk = "safe"
-        sentiment = "positive"
-        return whale_risk == "safe" and sentiment == "positive"
+        """Vérifie le spread du carnet d'ordres pour éviter les flash-crashs"""
+        try:
+            ob = self.exchange.fetch_order_book(symbol)
+            spread = (ob['asks'][0][0] - ob['bids'][0][0]) / ob['bids'][0][0]
+            # Si le spread est > 0.15%, le marché est trop instable (illiquide)
+            if spread > 0.0015:
+                print(f"⚠️ Sécurité: Spread trop large ({round(spread*100,3)}%)")
+                return False
+            return True
+        except:
+            return False
 
     def analyze_order_book(self, symbol):
         try:
@@ -84,27 +113,47 @@ class QuantisFinal:
             return "neutral"
 
     def run_strategy(self):
-        now_civ = datetime.now(TIMEZONE)
-        if not (START_HOUR <= now_civ.hour < END_HOUR):
+        # --- CORRECTION 3: Logique Circuit Breaker ---
+        if self.circuit_open:
+            print("⛔ CIRCUIT BREAKER ACTIVÉ - Pause de 5 min suite à erreurs répétées.")
+            time.sleep(300)
+            self.circuit_open = False
+            self.error_count = 0
             return
 
-        for symbol in SYMBOLS:
-            data_1d = self.get_indicators(symbol, '1d')
-            if not data_1d:
-                continue
+        try:
+            now_civ = datetime.now(TIMEZONE)
+            can_open_new = (START_HOUR <= now_civ.hour < END_HOUR)
 
-            if symbol in self.active_trades:
-                self.exit_trade_with_retracement(symbol)
-                continue
+            for symbol in SYMBOLS:
+                if symbol in self.active_trades:
+                    self.exit_trade_with_retracement(symbol)
+                    continue
 
-            safety_ok = self.check_external_safety(symbol)
-            book_pressure = self.analyze_order_book(symbol)
+                if not can_open_new:
+                    continue
 
-            if data_1d['direction'] == "bullish" and safety_ok and book_pressure == "buy":
-                self.enter_trade(symbol, data_1d, "LONG")
+                data_1d = self.get_indicators(symbol, '1d')
+                if not data_1d:
+                    continue
 
-            elif data_1d['direction'] == "bearish" and safety_ok and book_pressure == "sell":
-                self.enter_trade(symbol, data_1d, "SHORT")
+                safety_ok = self.check_external_safety(symbol)
+                book_pressure = self.analyze_order_book(symbol)
+
+                if data_1d['direction'] == "bullish" and safety_ok and book_pressure == "buy":
+                    self.enter_trade(symbol, data_1d, "LONG")
+
+                elif data_1d['direction'] == "bearish" and safety_ok and book_pressure == "sell":
+                    self.enter_trade(symbol, data_1d, "SHORT")
+            
+            self.error_count = 0 # Reset si tout se passe bien
+
+        except Exception as e:
+            self.error_count += 1
+            print(f"⚠️ Erreur #{self.error_count}: {e}")
+            if self.error_count >= self.max_errors:
+                self.circuit_open = True
+                self.send_notif("🚨 CIRCUIT BREAKER ACTIVÉ - Erreurs critiques détectées.")
 
     def enter_trade(self, symbol, data, side):
         entry = round(data['vwap'], 4)
@@ -124,7 +173,8 @@ class QuantisFinal:
             "entry": entry,
             "tp": tp,
             "sl": sl,
-            "ts": ts
+            "ts": ts,
+            "partial_done": False
         }
 
         self.send_notif(
@@ -143,29 +193,34 @@ class QuantisFinal:
         entry = trade['entry']
 
         data_1h = self.get_indicators(symbol, '1h')
+        if not data_1h: return 
+        
         price = data_1h['price']
         vwap = data_1h['vwap']
+        buffer = 0.005 
 
-        buffer = 0.002
+        # On ne traite la sortie partielle que si elle n'est pas déjà faite
+        if not trade.get("partial_done"):
+            should_exit = False
+            
+            if side == "LONG" and price < vwap * (1 - buffer):
+                should_exit = True
+            elif side == "SHORT" and price > vwap * (1 + buffer):
+                should_exit = True
 
-        if side == "LONG" and price > vwap * (1 - buffer):
-            return
-        if side == "SHORT" and price < vwap * (1 + buffer):
-            return
+            if should_exit:
+                pnl = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
+                
+                self.send_to_wunder(symbol, "partial_exit", entry, trade['tp'], trade['sl'], trade['ts'])
 
-        pnl = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
-        pnl = round(pnl, 2)
+                trade["partial_done"] = True
+                trade["sl"] = entry 
 
-        # Signal de sortie partielle envoyé ici
-        self.send_to_wunder(symbol, "partial_exit", entry, trade['tp'], trade['sl'], trade['ts'])
-
-        trade['sl'] = entry
-
-        self.send_notif(
-            f"💰 SORTIE PARTIELLE ({symbol})\n"
-            f"Profit sécurisé: {round(pnl/2,2)}%\n"
-            f"SL placé à break-even"
-        )
+                self.send_notif(
+                    f"💰 SORTIE PARTIELLE ({symbol})\n"
+                    f"Profit sécurisé: {round(pnl/2,2)}%\n"
+                    f"Le reste est protégé (SL au break-even)."
+                )
 
     def send_notif(self, msg):
         print(msg)
@@ -179,26 +234,28 @@ class QuantisFinal:
         if not WUNDERTRADE_WEBHOOK:
             return
 
-        # --- MODIFICATION POUR LES 50% ---
         wunder_action = action.lower()
-        amount_pct = 100  # Par défaut, on ferme tout
         
-        # Si c'est un retracement, on dit explicitement à WunderTrading de ne vendre que 50%
-        if wunder_action == "partial_exit":
-            wunder_action = "exit" 
-            amount_pct = 50       
-        # --------------------------------
-
         payload = {
-            "action": wunder_action,
             "pair": symbol.replace("/", ""),
-            "order_type": "limit" if action.lower() not in ["exit", "partial_exit"] else "market",
+            "order_type": "limit",
             "entry_price": entry,
-            "amount_pct": amount_pct,  # Indication explicite de la quantité à vendre
             "take_profit": round(abs(tp-entry)/entry*100,2),
             "stop_loss": round(abs(sl-entry)/entry*100,2),
             "trailing_stop": round(ts/entry*100,2)
         }
+
+        if wunder_action == "partial_exit":
+            payload["action"] = "exit"
+            payload["order_type"] = "market"
+            payload["amount"] = "50%" 
+        elif wunder_action == "exit":
+            payload["action"] = "exit"
+            payload["order_type"] = "market"
+            payload["amount"] = "100%"
+        else:
+            payload["action"] = wunder_action
+            payload["amount"] = "100%"
 
         try:
             requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=5)
@@ -210,8 +267,5 @@ quantis = QuantisFinal()
 print("✅ Quantis IA Connecté – Futures – Abidjan Time")
 
 while True:
-    try:
-        quantis.run_strategy()
-    except Exception as e:
-        print(f"Erreur Système: {e}")
+    quantis.run_strategy()
     time.sleep(30)
