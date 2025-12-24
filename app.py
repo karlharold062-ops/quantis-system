@@ -257,15 +257,27 @@ class QuantisFinal:
 
         wunder_action = action.lower()
         order_type = "limit"
-        amount = "100%"
 
-        if wunder_action == "partial_exit":
-            wunder_action = "exit"
-            order_type = "market" 
-            amount = "50%"
-        elif wunder_action == "exit":
-            wunder_action = "exit"
-            order_type = "market"
+        # --- AMOUNT TOTALEMENT DYNAMIQUE ---
+        try:
+            balance_info = self.exchange.fetch_balance()
+            usdt_balance = balance_info['total'].get('USDT', 0)
+
+            if wunder_action == "partial_exit":
+                amount_usdt = usdt_balance * 0.5
+                order_type = "market"
+                wunder_action = "exit"
+            elif wunder_action == "exit":
+                amount_usdt = usdt_balance
+                order_type = "market"
+            else:
+                amount_usdt = usdt_balance * 0.05
+
+            qty = round(amount_usdt / entry, 6)
+            amount = qty
+
+        except Exception as e:
+            print(f"⚠️ Impossible de calculer amount dynamique: {e}")
             amount = "100%"
 
         payload = {
@@ -279,7 +291,6 @@ class QuantisFinal:
             "trailing_stop": round(ts/entry*100,2)
         }
 
-        # Tentative d'envoi avec 2 retries en cas d'échec réseau
         for attempt in range(2):
             try:
                 r = requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=10)
