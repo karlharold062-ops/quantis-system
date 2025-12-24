@@ -1,14 +1,4 @@
-Flask
-flask-cors
-python-telegram-bot
 ccxt
-firebase-admin
 requests
-gunicorn
 pandas
-numpy
-ta
-loguru
-psutil
-schedule
 pytz
