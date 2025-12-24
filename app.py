@@ -36,7 +36,8 @@ class QuantisFinal:
         self.exchange = ccxt.bybit({
             'apiKey': os.getenv("BYBIT_API_KEY"),
             'secret': os.getenv("BYBIT_API_SECRET"),
-            'enableRateLimit': True
+            'enableRateLimit': True,
+            'timeout': 30000  # Timeout de 30s pour éviter les blocages API
         })
         self.active_trades = {}
         
@@ -53,11 +54,16 @@ class QuantisFinal:
             msg = f"❌ ERREUR CRITIQUE: Variables manquantes : {missing}"
             print(msg)
             if DISCORD_WEBHOOK:
-                try: requests.post(DISCORD_WEBHOOK, json={"content": msg})
+                try: requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=5)
                 except: pass
             raise EnvironmentError(msg)
 
     def get_indicators(self, symbol, timeframe='1d'):
+        """
+        Calcul des indicateurs :
+        - VWAP : Prix moyen pondéré par le volume (Pivot institutionnel)
+        - ATR (14) : Utilisé pour le calcul dynamique du TP (ATR*2) et SL (ATR*1.5)
+        """
         try:
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
@@ -85,7 +91,7 @@ class QuantisFinal:
             return None
 
     def check_external_safety(self, symbol):
-        """Vérifie le spread du carnet d'ordres pour éviter les flash-crashs"""
+        """Vérifie le spread du carnet d'ordres pour éviter les flash-crashs (limite 0.15%)"""
         try:
             ob = self.exchange.fetch_order_book(symbol)
             spread = (ob['asks'][0][0] - ob['bids'][0][0]) / ob['bids'][0][0]
@@ -97,6 +103,7 @@ class QuantisFinal:
             return False
 
     def analyze_order_book(self, symbol):
+        """Analyse la pression acheteuse/vendeuse (seuil 20% d'écart)"""
         try:
             ob = self.exchange.fetch_order_book(symbol)
             bids = sum(b[1] for b in ob['bids'][:10])
@@ -172,7 +179,7 @@ class QuantisFinal:
             "sl": sl,
             "ts": ts,
             "partial_done": False,
-            "be_protected": False # Nouveau flag pour le suivi
+            "be_protected": False 
         }
 
         self.send_notif(
@@ -184,6 +191,11 @@ class QuantisFinal:
         self.send_to_wunder(symbol, side, entry, tp, sl, ts)
 
     def exit_trade_with_retracement(self, symbol):
+        """
+        Gestion des sorties :
+        - BE @ 1% : Remonte le SL au prix d'entrée dès que le gain atteint 1%
+        - Sortie Partielle : Sortie de 50% si le prix croise le VWAP 1H (buffer 0.5% pour éviter le bruit)
+        """
         trade = self.active_trades[symbol]
         side = trade['dir']
         entry = trade['entry']
@@ -193,13 +205,13 @@ class QuantisFinal:
         
         price = data_1h['price']
         vwap = data_1h['vwap']
-        buffer = 0.005 
+        buffer = 0.005 # Zone de tolérance de 0.5% autour du VWAP pour confirmer le retournement
 
         # --- STRATÉGIE OPTION A : TRAILING STOP AGRESSIF (BE à 1%) ---
         current_pnl = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
         
         if not trade.get("be_protected") and current_pnl >= 1.0:
-            trade["sl"] = entry # Remonte le SL au prix d'entrée
+            trade["sl"] = entry 
             trade["be_protected"] = True
             self.send_notif(f"🛡️ PROTECTION BE ({symbol}) : Prix à +1%, SL déplacé à l'entrée.")
 
@@ -210,7 +222,7 @@ class QuantisFinal:
             del self.active_trades[symbol]
             return
 
-        # --- LOGIQUE DE SORTIE PARTIELLE INITIALE ---
+        # --- LOGIQUE DE SORTIE PARTIELLE ---
         if not trade.get("partial_done"):
             should_exit = False
             
@@ -236,7 +248,7 @@ class QuantisFinal:
     def send_notif(self, msg):
         print(msg)
         if DISCORD_WEBHOOK and "http" in DISCORD_WEBHOOK:
-            try: requests.post(DISCORD_WEBHOOK, json={"content": msg})
+            try: requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=5)
             except: pass
 
     def send_to_wunder(self, symbol, action, entry, tp, sl, ts):
@@ -267,15 +279,27 @@ class QuantisFinal:
             "trailing_stop": round(ts/entry*100,2)
         }
 
-        try:
-            requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=5)
-        except Exception as e:
-            print(f"Erreur WunderTrading : {e}")
+        # Tentative d'envoi avec 2 retries en cas d'échec réseau
+        for attempt in range(2):
+            try:
+                r = requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=10)
+                if r.status_code == 200:
+                    return
+            except Exception as e:
+                print(f"Tentative {attempt+1} échouée pour WunderTrading : {e}")
+                time.sleep(2)
 
 # ===================== DÉMARRAGE =====================
 quantis = QuantisFinal()
 print("✅ Quantis IA Connecté – Futures – Abidjan Time")
 
 while True:
-    quantis.run_strategy()
-    time.sleep(30)
+    try:
+        quantis.run_strategy()
+        time.sleep(30)
+    except KeyboardInterrupt:
+        print("Arrêt du bot...")
+        break
+    except Exception as e:
+        print(f"Erreur boucle principale : {e}")
+        time.sleep(10)
