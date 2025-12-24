@@ -7,17 +7,21 @@ from datetime import datetime
 import pytz
 
 # ===================== CONFIGURATION QUANTIS PRO =====================
-# Choisis ici les paires à surveiller
-# 1 paire seule : ZEC
+# Choisis ici UNE SEULE paire à la fois (FUTURES)
+
+# 1️⃣ ETHUSDT FUTURES
+SYMBOLS = ["ETH/USDT"]
+
+# 2️⃣ SOLUSDT FUTURES
+# SYMBOLS = ["SOL/USDT"]
+
+# 3️⃣ ZECUSDT FUTURES
 # SYMBOLS = ["ZEC/USDT"]
-# 1 paire seule : ETH
-# SYMBOLS = ["ETH/USDT"]
-# 2 paires : ZEC + ETH
-SYMBOLS = ["ZEC/USDT", "ETH/USDT"]
 
 TIMEZONE = pytz.timezone("Africa/Abidjan")
 START_HOUR = 13
 END_HOUR = 22
+# =====================================================
 
 WHALE_API_KEY = os.getenv("WHALE_ALERT_KEY")
 CP_API_KEY = os.getenv("CRYPTOPANIC_KEY")
@@ -37,10 +41,16 @@ class QuantisFinal:
         try:
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+
             typical_price = (df['h'] + df['l'] + df['c']) / 3
             df['vwap'] = (typical_price * df['v']).cumsum() / df['v'].cumsum()
+
             df['tr'] = df[['h', 'l', 'c']].apply(
-                lambda x: max(x[0]-x[1], abs(x[0]-x[2]), abs(x[1]-x[2])), axis=1
+                lambda x: max(
+                    x[0] - x[1],
+                    abs(x[0] - x[2]),
+                    abs(x[1] - x[2])
+                ), axis=1
             )
             df['atr'] = df['tr'].rolling(14).mean()
 
@@ -62,10 +72,13 @@ class QuantisFinal:
     def analyze_order_book(self, symbol):
         try:
             ob = self.exchange.fetch_order_book(symbol)
-            bids = sum([b[1] for b in ob['bids'][:10]])
-            asks = sum([a[1] for a in ob['asks'][:10]])
-            if bids > (asks * 1.2): return "buy"
-            if asks > (bids * 1.2): return "sell"
+            bids = sum(b[1] for b in ob['bids'][:10])
+            asks = sum(a[1] for a in ob['asks'][:10])
+
+            if bids > asks * 1.2:
+                return "buy"
+            if asks > bids * 1.2:
+                return "sell"
             return "neutral"
         except:
             return "neutral"
@@ -87,141 +100,72 @@ class QuantisFinal:
             safety_ok = self.check_external_safety(symbol)
             book_pressure = self.analyze_order_book(symbol)
 
-            # --- Confirmation 1H avant entrée ---
-            data_1h = self.get_indicators(symbol, '1h')
-            if not data_1h:
-                continue
-
-            if data_1d['direction'] == "bullish" and data_1h['direction'] == "bullish" and safety_ok and book_pressure == "buy":
+            if data_1d['direction'] == "bullish" and safety_ok and book_pressure == "buy":
                 self.enter_trade(symbol, data_1d, "LONG")
-            elif data_1d['direction'] == "bearish" and data_1h['direction'] == "bearish" and safety_ok and book_pressure == "sell":
+
+            elif data_1d['direction'] == "bearish" and safety_ok and book_pressure == "sell":
                 self.enter_trade(symbol, data_1d, "SHORT")
 
     def enter_trade(self, symbol, data, side):
-        limit_price = round(data['vwap'], 4)
+        entry = round(data['vwap'], 4)
         atr = data['atr']
 
         if side == "LONG":
-            tp = limit_price + (atr * 2.0)
-            sl = limit_price - (atr * 1.5)
+            tp = entry + atr * 2.0
+            sl = entry - atr * 1.5
         else:
-            tp = limit_price - (atr * 2.0)
-            sl = limit_price + (atr * 1.5)
+            tp = entry - atr * 2.0
+            sl = entry + atr * 1.5
 
-        ts_activation = atr * 0.5
+        ts = atr * 0.5
 
         self.active_trades[symbol] = {
-            'dir': side,
-            'entry': limit_price,
-            'tp': tp,
-            'sl': sl,
-            'ts': ts_activation
+            "dir": side,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "ts": ts
         }
 
-        tp_pct = round(abs(tp - limit_price) / limit_price * 100, 2)
-        sl_pct = round(abs(sl - limit_price) / limit_price * 100, 2)
-        ts_pct = round(ts_activation / limit_price * 100, 2)
-
-        msg = (
-            f"🎯 **ORDRE LIMITE {side} 1J ({symbol})**\n"
-            f"Entrée (VWAP): {limit_price}\n"
-            f"TP: {tp_pct}% | SL: {sl_pct}% | TS: {ts_pct}%"
-        )
-        self.send_notif(msg)
-        self.send_to_wunder(symbol, side, limit_price, tp, sl, ts_activation)
-
-    def exit_trade(self, symbol, reason):
-        if symbol in self.active_trades:
-            trade = self.active_trades[symbol]
-            self.send_to_wunder(symbol, "exit", trade['entry'], trade['tp'], trade['sl'], trade['ts'])
-            del self.active_trades[symbol]
-            self.send_notif(f"⚠️ **SORTIE D'URGENCE ({symbol})**\nRaison: {reason}")
-
-    # ================== AJOUT : SORTIE RETRACEMENT ==================
-    def exit_trade_market_capture(self, symbol, reason):
-        trade = self.active_trades[symbol]
-        current_price = self.get_indicators(symbol, '1h')['price']
-        entry = trade['entry']
-        side = trade['dir']
-
-        if side == "LONG":
-            pnl_pct = round((current_price - entry) / entry * 100, 2)
-        else:
-            pnl_pct = round((entry - current_price) / entry * 100, 2)
-
-        self.send_to_wunder(
-            symbol,
-            "exit",
-            entry,
-            trade['tp'],
-            trade['sl'],
-            trade['ts']
-        )
-
-        del self.active_trades[symbol]
-
         self.send_notif(
-            f"💰 **SORTIE RETRACEMENT ({symbol})**\n"
-            f"Raison: {reason}\n"
-            f"Profit marché: {pnl_pct}%"
+            f"🎯 ORDRE {side} 1J ({symbol})\n"
+            f"Entrée VWAP: {entry}\n"
+            f"TP: {round(abs(tp-entry)/entry*100,2)}% | "
+            f"SL: {round(abs(sl-entry)/entry*100,2)}% | "
+            f"TS: {round(ts/entry*100,2)}%"
         )
+
+        self.send_to_wunder(symbol, side, entry, tp, sl, ts)
 
     def exit_trade_with_retracement(self, symbol):
-        """
-        Sortie intelligente avec :
-        1. Filtre de clôture sur la bougie 1H
-        2. Buffer dynamique basé sur ATR
-        3. Sortie partielle pour sécuriser profit
-        4. Trailing stop pour la position restante
-        """
-        if symbol not in self.active_trades:
-            return
-
         trade = self.active_trades[symbol]
         side = trade['dir']
         entry = trade['entry']
 
-        # --- 1. Filtre 1H ---
         data_1h = self.get_indicators(symbol, '1h')
-        if not data_1h:
-            return
-        price_close = data_1h['price']
-        vwap_1h = data_1h['vwap']
-        atr_1h = data_1h['atr']
+        price = data_1h['price']
+        vwap = data_1h['vwap']
 
-        # --- 2. Buffer dynamique ---
-        buffer = max(0.002, atr_1h / price_close)
-        if side == "LONG" and price_close > vwap_1h * (1 - buffer):
+        buffer = 0.002
+
+        if side == "LONG" and price > vwap * (1 - buffer):
             return
-        if side == "SHORT" and price_close < vwap_1h * (1 + buffer):
+        if side == "SHORT" and price < vwap * (1 + buffer):
             return
 
-        # --- 3. Sortie partielle ---
-        pnl_pct_full = round((price_close - entry) / entry * 100, 2) if side == "LONG" else round((entry - price_close) / entry * 100, 2)
-        pnl_pct_partial = pnl_pct_full / 2
+        pnl = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
+        pnl = round(pnl, 2)
 
-        self.send_to_wunder(
-            symbol,
-            "partial_exit",
-            entry,
-            trade['tp'],
-            trade['sl'],
-            trade['ts']
-        )
+        # Signal de sortie partielle envoyé ici
+        self.send_to_wunder(symbol, "partial_exit", entry, trade['tp'], trade['sl'], trade['ts'])
 
-        # --- 4. Trailing stop pour le reste ---
-        if side == "LONG":
-            trade['sl'] = max(trade['sl'], price_close - atr_1h)
-        else:
-            trade['sl'] = min(trade['sl'], price_close + atr_1h)
+        trade['sl'] = entry
 
         self.send_notif(
-            f"💰 **SORTIE PARTIELLE ({symbol})**\n"
-            f"Prix actuel: {price_close}\n"
-            f"Profit sécurisé: {pnl_pct_partial}%\n"
-            f"Stop de la position restante ajusté avec trailing ATR"
+            f"💰 SORTIE PARTIELLE ({symbol})\n"
+            f"Profit sécurisé: {round(pnl/2,2)}%\n"
+            f"SL placé à break-even"
         )
-    # ==========================================================
 
     def send_notif(self, msg):
         print(msg)
@@ -235,18 +179,25 @@ class QuantisFinal:
         if not WUNDERTRADE_WEBHOOK:
             return
 
-        tp_pct = round(abs(tp - entry) / entry * 100, 2)
-        sl_pct = round(abs(sl - entry) / entry * 100, 2)
-        ts_pct = round(ts / entry * 100, 2)
+        # --- MODIFICATION POUR LES 50% ---
+        wunder_action = action.lower()
+        amount_pct = 100  # Par défaut, on ferme tout
+        
+        # Si c'est un retracement, on dit explicitement à WunderTrading de ne vendre que 50%
+        if wunder_action == "partial_exit":
+            wunder_action = "exit" 
+            amount_pct = 50       
+        # --------------------------------
 
         payload = {
-            "action": action.lower(),
+            "action": wunder_action,
             "pair": symbol.replace("/", ""),
-            "order_type": "limit" if action.lower() != "exit" else "market",
+            "order_type": "limit" if action.lower() not in ["exit", "partial_exit"] else "market",
             "entry_price": entry,
-            "take_profit": tp_pct,
-            "stop_loss": sl_pct,
-            "trailing_stop": ts_pct
+            "amount_pct": amount_pct,  # Indication explicite de la quantité à vendre
+            "take_profit": round(abs(tp-entry)/entry*100,2),
+            "stop_loss": round(abs(sl-entry)/entry*100,2),
+            "trailing_stop": round(ts/entry*100,2)
         }
 
         try:
@@ -256,7 +207,7 @@ class QuantisFinal:
 
 # ===================== DÉMARRAGE =====================
 quantis = QuantisFinal()
-print("✅ Quantis IA Connecté - Mode LONG & SHORT (Abidjan Time)")
+print("✅ Quantis IA Connecté – Futures – Abidjan Time")
 
 while True:
     try:
