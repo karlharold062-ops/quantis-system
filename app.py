@@ -171,7 +171,8 @@ class QuantisFinal:
             "tp": tp,
             "sl": sl,
             "ts": ts,
-            "partial_done": False
+            "partial_done": False,
+            "be_protected": False # Nouveau flag pour le suivi
         }
 
         self.send_notif(
@@ -194,6 +195,22 @@ class QuantisFinal:
         vwap = data_1h['vwap']
         buffer = 0.005 
 
+        # --- STRATÉGIE OPTION A : TRAILING STOP AGRESSIF (BE à 1%) ---
+        current_pnl = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
+        
+        if not trade.get("be_protected") and current_pnl >= 1.0:
+            trade["sl"] = entry # Remonte le SL au prix d'entrée
+            trade["be_protected"] = True
+            self.send_notif(f"🛡️ PROTECTION BE ({symbol}) : Prix à +1%, SL déplacé à l'entrée.")
+
+        # --- SORTIE SI LE PRIX TOUCHE LE SL (PROTECTION FAKEOUT) ---
+        if (side == "LONG" and price <= trade['sl']) or (side == "SHORT" and price >= trade['sl']):
+            self.send_to_wunder(symbol, "exit", entry, trade['tp'], trade['sl'], trade['ts'])
+            self.send_notif(f"🛑 SORTIE DE PROTECTION ({symbol}) : SL touché à {price}. Trade terminé.")
+            del self.active_trades[symbol]
+            return
+
+        # --- LOGIQUE DE SORTIE PARTIELLE INITIALE ---
         if not trade.get("partial_done"):
             should_exit = False
             
@@ -227,14 +244,12 @@ class QuantisFinal:
             return
 
         wunder_action = action.lower()
-        
-        # --- CORRECTION ICI : ORDRE LIMITE POUR L'ENTRÉE ---
         order_type = "limit"
         amount = "100%"
 
         if wunder_action == "partial_exit":
             wunder_action = "exit"
-            order_type = "market" # Sortie rapide
+            order_type = "market" 
             amount = "50%"
         elif wunder_action == "exit":
             wunder_action = "exit"
@@ -244,8 +259,8 @@ class QuantisFinal:
         payload = {
             "action": wunder_action,
             "pair": symbol.replace("/", ""),
-            "order_type": order_type,      # 'limit' pour l'entrée, 'market' pour la sortie
-            "entry_price": entry,          # Prix VWAP
+            "order_type": order_type,
+            "entry_price": entry,
             "amount": amount,
             "take_profit": round(abs(tp-entry)/entry*100,2),
             "stop_loss": round(abs(sl-entry)/entry*100,2),
