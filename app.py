@@ -52,7 +52,6 @@ class QuantisFinal:
         if missing:
             msg = f"❌ ERREUR CRITIQUE: Variables manquantes : {missing}"
             print(msg)
-            # On envoie une notif si possible avant de crash
             if DISCORD_WEBHOOK:
                 try: requests.post(DISCORD_WEBHOOK, json={"content": msg})
                 except: pass
@@ -90,7 +89,6 @@ class QuantisFinal:
         try:
             ob = self.exchange.fetch_order_book(symbol)
             spread = (ob['asks'][0][0] - ob['bids'][0][0]) / ob['bids'][0][0]
-            # Si le spread est > 0.15%, le marché est trop instable (illiquide)
             if spread > 0.0015:
                 print(f"⚠️ Sécurité: Spread trop large ({round(spread*100,3)}%)")
                 return False
@@ -113,7 +111,6 @@ class QuantisFinal:
             return "neutral"
 
     def run_strategy(self):
-        # --- CORRECTION 3: Logique Circuit Breaker ---
         if self.circuit_open:
             print("⛔ CIRCUIT BREAKER ACTIVÉ - Pause de 5 min suite à erreurs répétées.")
             time.sleep(300)
@@ -146,7 +143,7 @@ class QuantisFinal:
                 elif data_1d['direction'] == "bearish" and safety_ok and book_pressure == "sell":
                     self.enter_trade(symbol, data_1d, "SHORT")
             
-            self.error_count = 0 # Reset si tout se passe bien
+            self.error_count = 0 
 
         except Exception as e:
             self.error_count += 1
@@ -178,11 +175,9 @@ class QuantisFinal:
         }
 
         self.send_notif(
-            f"🎯 ORDRE {side} 1J ({symbol})\n"
-            f"Entrée VWAP: {entry}\n"
-            f"TP: {round(abs(tp-entry)/entry*100,2)}% | "
-            f"SL: {round(abs(sl-entry)/entry*100,2)}% | "
-            f"TS: {round(ts/entry*100,2)}%"
+            f"🎯 ORDRE LIMITE {side} 1J ({symbol})\n"
+            f"Entrée VWAP : {entry}\n"
+            f"TP : {round(abs(tp-entry)/entry*100,2)}% | SL : {round(abs(sl-entry)/entry*100,2)}%"
         )
 
         self.send_to_wunder(symbol, side, entry, tp, sl, ts)
@@ -199,7 +194,6 @@ class QuantisFinal:
         vwap = data_1h['vwap']
         buffer = 0.005 
 
-        # On ne traite la sortie partielle que si elle n'est pas déjà faite
         if not trade.get("partial_done"):
             should_exit = False
             
@@ -218,17 +212,15 @@ class QuantisFinal:
 
                 self.send_notif(
                     f"💰 SORTIE PARTIELLE ({symbol})\n"
-                    f"Profit sécurisé: {round(pnl/2,2)}%\n"
-                    f"Le reste est protégé (SL au break-even)."
+                    f"Profit sécurisé : {round(pnl/2,2)}%\n"
+                    f"Reste au break-even (SL au prix d'entrée)."
                 )
 
     def send_notif(self, msg):
         print(msg)
         if DISCORD_WEBHOOK and "http" in DISCORD_WEBHOOK:
-            try:
-                requests.post(DISCORD_WEBHOOK, json={"content": msg})
-            except:
-                pass
+            try: requests.post(DISCORD_WEBHOOK, json={"content": msg})
+            except: pass
 
     def send_to_wunder(self, symbol, action, entry, tp, sl, ts):
         if not WUNDERTRADE_WEBHOOK:
@@ -236,31 +228,34 @@ class QuantisFinal:
 
         wunder_action = action.lower()
         
+        # --- CORRECTION ICI : ORDRE LIMITE POUR L'ENTRÉE ---
+        order_type = "limit"
+        amount = "100%"
+
+        if wunder_action == "partial_exit":
+            wunder_action = "exit"
+            order_type = "market" # Sortie rapide
+            amount = "50%"
+        elif wunder_action == "exit":
+            wunder_action = "exit"
+            order_type = "market"
+            amount = "100%"
+
         payload = {
+            "action": wunder_action,
             "pair": symbol.replace("/", ""),
-            "order_type": "limit",
-            "entry_price": entry,
+            "order_type": order_type,      # 'limit' pour l'entrée, 'market' pour la sortie
+            "entry_price": entry,          # Prix VWAP
+            "amount": amount,
             "take_profit": round(abs(tp-entry)/entry*100,2),
             "stop_loss": round(abs(sl-entry)/entry*100,2),
             "trailing_stop": round(ts/entry*100,2)
         }
 
-        if wunder_action == "partial_exit":
-            payload["action"] = "exit"
-            payload["order_type"] = "market"
-            payload["amount"] = "50%" 
-        elif wunder_action == "exit":
-            payload["action"] = "exit"
-            payload["order_type"] = "market"
-            payload["amount"] = "100%"
-        else:
-            payload["action"] = wunder_action
-            payload["amount"] = "100%"
-
         try:
             requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=5)
         except Exception as e:
-            print(f"Erreur WunderTrading: {e}")
+            print(f"Erreur WunderTrading : {e}")
 
 # ===================== DÉMARRAGE =====================
 quantis = QuantisFinal()
