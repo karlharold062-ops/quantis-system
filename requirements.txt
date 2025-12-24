@@ -1,4 +1,4 @@
-flask
+Flask
 flask-cors
 python-telegram-bot
 ccxt
@@ -11,3 +11,4 @@ ta
 loguru
 psutil
 schedule
+pytz
