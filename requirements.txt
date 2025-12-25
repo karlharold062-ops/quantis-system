@@ -1,4 +1,4 @@
-ccxt
-requests
-pandas
-pytz
+ccxt>=4.2.0
+pandas>=2.0.0
+requests>=2.31.0
+pytz>=2023.3
