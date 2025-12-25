@@ -192,9 +192,7 @@ class QuantisFinal:
 
     def exit_trade_with_retracement(self, symbol):
         """
-        Gestion des sorties :
-        - BE @ 1% : Remonte le SL au prix d'entrée dès que le gain atteint 1%
-        - Sortie Partielle : Sortie de 50% si le prix croise le VWAP 1H (buffer 0.5% pour éviter le bruit)
+        Gestion des sorties IDENTIQUE avec ajout du Step-Trailing +1.5%/+1%
         """
         trade = self.active_trades[symbol]
         side = trade['dir']
@@ -205,24 +203,26 @@ class QuantisFinal:
         
         price = data_1h['price']
         vwap = data_1h['vwap']
-        buffer = 0.005 # Zone de tolérance de 0.5% autour du VWAP pour confirmer le retournement
+        buffer = 0.005 
 
-        # --- STRATÉGIE OPTION A : TRAILING STOP AGRESSIF (BE à 1%) ---
         current_pnl = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
         
-        if not trade.get("be_protected") and current_pnl >= 1.0:
-            trade["sl"] = entry 
+        # --- LOGIQUE STEP-TRAILING (MODIFIÉE ICI) ---
+        if not trade.get("be_protected") and current_pnl >= 1.5:
+            # On verrouille 1% de gain au lieu de 0%
+            trade["sl"] = entry * 1.01 if side == "LONG" else entry * 0.99
             trade["be_protected"] = True
-            self.send_notif(f"🛡️ PROTECTION BE ({symbol}) : Prix à +1%, SL déplacé à l'entrée.")
+            self.send_notif(f"🛡️ STEP-TRAILING ACTIVÉ ({symbol}) : Profit +1% verrouillé (Prix à +1.5%).")
 
-        # --- SORTIE SI LE PRIX TOUCHE LE SL (PROTECTION FAKEOUT) ---
+        # --- SORTIE SI LE PRIX TOUCHE LE SL (ENCAISSEMENT DES 1% OU STOP INITIAL) ---
         if (side == "LONG" and price <= trade['sl']) or (side == "SHORT" and price >= trade['sl']):
             self.send_to_wunder(symbol, "exit", entry, trade['tp'], trade['sl'], trade['ts'])
-            self.send_notif(f"🛑 SORTIE DE PROTECTION ({symbol}) : SL touché à {price}. Trade terminé.")
+            msg = "💰 ENCAISSEMENT +1%" if trade.get("be_protected") else "🛑 STOP LOSS"
+            self.send_notif(f"{msg} ({symbol}) : Position fermée à {price}.")
             del self.active_trades[symbol]
             return
 
-        # --- LOGIQUE DE SORTIE PARTIELLE ---
+        # --- LOGIQUE DE SORTIE PARTIELLE AU VWAP 1H ---
         if not trade.get("partial_done"):
             should_exit = False
             
@@ -258,7 +258,7 @@ class QuantisFinal:
         wunder_action = action.lower()
         order_type = "limit"
 
-        # --- AMOUNT TOTALEMENT DYNAMIQUE ---
+        # --- AMOUNT TOTALEMENT DYNAMIQUE (CONSERVÉ) ---
         try:
             balance_info = self.exchange.fetch_balance()
             usdt_balance = balance_info['total'].get('USDT', 0)
