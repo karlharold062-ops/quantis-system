@@ -45,6 +45,7 @@ class QuantisFinal:
         self.error_count = 0
         self.max_errors = 5
         self.circuit_open = False
+        self.report_sent = False # Pour le bilan de 13h
 
     def validate_environment(self):
         """Vérifie la présence des clés essentielles avant de démarrer"""
@@ -127,11 +128,23 @@ class QuantisFinal:
 
         try:
             now_civ = datetime.now(TIMEZONE)
+
+            # --- LOGIQUE BILAN 13H ---
+            if now_civ.hour == 13 and not self.report_sent:
+                data_1d = self.get_indicators(SYMBOLS[0], '1d')
+                msg = f"📊 **BILAN 13H00**\nBougie du jour : {data_1d['direction'].upper()}\nPrix : {data_1d['price']}\nPrêt pour analyse de session."
+                self.send_notif(msg)
+                self.report_sent = True
+            
+            if now_civ.hour != 13:
+                self.report_sent = False
+
             can_open_new = (START_HOUR <= now_civ.hour < END_HOUR)
 
             for symbol in SYMBOLS:
                 if symbol in self.active_trades:
-                    self.exit_trade_with_retracement(symbol)
+                    # Ajout de l'heure pour la sortie à la clôture
+                    self.exit_trade_with_retracement(symbol, now_civ)
                     continue
 
                 if not can_open_new:
@@ -190,11 +203,12 @@ class QuantisFinal:
 
         self.send_to_wunder(symbol, side, entry, tp, sl, ts)
 
-    def exit_trade_with_retracement(self, symbol):
+    def exit_trade_with_retracement(self, symbol, now_civ):
         """
-        LOGIQUE DE SORTIE STRATÉGIQUE (Moon Shot) :
+        LOGIQUE DE SORTIE MODIFIÉE :
+        - Fermeture à 21h59 si TP non atteint.
         - À +1.5% : Sortie 50% immédiate.
-        - Sécurisation du reste à +0.5% (Profit garanti).
+        - Sécurisation du reste à +0.5%.
         """
         trade = self.active_trades[symbol]
         side = trade['dir']
@@ -205,14 +219,18 @@ class QuantisFinal:
             return
 
         price = data_1h['price']
-
-        # Calcul PnL %
         pnl = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+
+        # --- NOUVEAU : SORTIE À LA CLÔTURE DE BOUGIE (21H59) ---
+        if now_civ.hour == 21 and now_civ.minute == 59:
+            self.send_to_wunder(symbol, "exit", entry, trade["tp"], trade["sl"], trade["ts"])
+            self.send_notif(f"⏰ FERMETURE SESSION ({symbol}) → Sortie au prix du marché : {round(pnl,2)}%")
+            del self.active_trades[symbol]
+            return
 
         # 1️⃣ Sortie partielle à +1.5%
         if pnl >= 1.5 and not trade["partial_done"]:
             self.send_to_wunder(symbol, "partial_exit", entry, trade["tp"], trade["sl"], trade["ts"])
-            # SL du reste à +0.5%
             trade["sl"] = entry * 1.005 if side == "LONG" else entry * 0.995
             trade["partial_done"] = True
             trade["be_protected"] = True
@@ -267,7 +285,6 @@ class QuantisFinal:
             print(f"⚠️ Impossible de calculer amount dynamique: {e}")
             amount = "100%"
 
-        # --- CORRECTION POST_ONLY POUR 1M$ ---
         payload = {
             "action": wunder_action,
             "pair": symbol.replace("/", ""),
