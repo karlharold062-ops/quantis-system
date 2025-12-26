@@ -267,12 +267,14 @@ class QuantisFinal:
             print(f"⚠️ Impossible de calculer amount dynamique: {e}")
             amount = "100%"
 
+        # --- CORRECTION POST_ONLY POUR 1M$ ---
         payload = {
             "action": wunder_action,
             "pair": symbol.replace("/", ""),
             "order_type": order_type,
             "entry_price": entry,
             "amount": amount,
+            "post_only": True if order_type == "limit" else False,
             "take_profit": round(abs(tp-entry)/entry*100,2),
             "stop_loss": round(abs(sl-entry)/entry*100,2),
             "trailing_stop": round(ts/entry*100,2)
