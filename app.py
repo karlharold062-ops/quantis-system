@@ -64,6 +64,7 @@ class QuantisFinal:
         Calcul des indicateurs :
         - VWAP : Prix moyen pondéré par le volume (Pivot institutionnel)
         - ATR (14) : Utilisé pour le calcul dynamique du TP (ATR*2) et SL (ATR*1.5)
+        - RSI (14) : Ajouté pour filtrer les sorties et éviter les respirations
         """
         try:
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
@@ -81,10 +82,18 @@ class QuantisFinal:
             )
             df['atr'] = df['tr'].rolling(14).mean()
 
+            # --- CALCUL DU RSI (Option 1) ---
+            delta = df['c'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['rsi'] = 100 - (100 / (1 + rs))
+
             return {
                 "price": df['c'].iloc[-1],
                 "vwap": df['vwap'].iloc[-1],
                 "atr": df['atr'].iloc[-1],
+                "rsi": df['rsi'].iloc[-1],
                 "direction": "bullish" if df['c'].iloc[-1] > df['vwap'].iloc[-1] else "bearish"
             }
         except Exception as e:
@@ -205,8 +214,9 @@ class QuantisFinal:
 
     def exit_trade_with_retracement(self, symbol, now_civ):
         """
-        LOGIQUE DE SORTIE MODIFIÉE :
-        - Fermeture à 21h59 si TP non atteint.
+        LOGIQUE DE SORTIE :
+        - Sortie filtrée par RSI + Clôture à la minute 59 (Option 1 & 3).
+        - Fermeture à 21h59 si trade encore ouvert.
         - À +1.5% : Sortie 50% immédiate.
         - Sécurisation du reste à +0.5%.
         """
@@ -214,41 +224,58 @@ class QuantisFinal:
         side = trade['dir']
         entry = trade['entry']
 
-        data_1h = self.get_indicators(symbol, '1h')
-        if not data_1h:
+        # 1️⃣ ANALYSE DU SIGNAL ACTUEL (MTF)
+        data_now = self.get_indicators(symbol, '1h')
+        if not data_now:
             return
 
-        price = data_1h['price']
+        price = data_now['price']
+        current_dir = data_now['direction']
+        current_rsi = data_now['rsi']
         pnl = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
 
-        # --- NOUVEAU : SORTIE À LA CLÔTURE DE BOUGIE (21H59) ---
+        # --- 🚨 NOUVEAU : SORTIE FILTRÉE PAR RSI ET CLÔTURE (OPTION 1 & 3) ---
+        # Le bot ne vérifie l'inversion de signal qu'à la 59ème minute pour éviter les mèches
+        if now_civ.minute == 59:
+            if side == "LONG" and current_dir == "bearish" and current_rsi < 45:
+                self.send_to_wunder(symbol, "exit", entry, trade["tp"], trade["sl"], trade["ts"])
+                self.send_notif(f"🔄 SIGNAL INVERSÉ + RSI ({symbol}) → Sortie au marché : {round(pnl,2)}%")
+                del self.active_trades[symbol]
+                return
+            elif side == "SHORT" and current_dir == "bullish" and current_rsi > 55:
+                self.send_to_wunder(symbol, "exit", entry, trade["tp"], trade["sl"], trade["ts"])
+                self.send_notif(f"🔄 SIGNAL INVERSÉ + RSI ({symbol}) → Sortie au marché : {round(pnl,2)}%")
+                del self.active_trades[symbol]
+                return
+
+        # --- FERMETURE À 21H59 ---
         if now_civ.hour == 21 and now_civ.minute == 59:
             self.send_to_wunder(symbol, "exit", entry, trade["tp"], trade["sl"], trade["ts"])
-            self.send_notif(f"⏰ FERMETURE SESSION ({symbol}) → Sortie au prix du marché : {round(pnl,2)}%")
+            self.send_notif(f"⏰ FIN DE SESSION ({symbol}) → Sortie finale : {round(pnl,2)}%")
             del self.active_trades[symbol]
             return
 
-        # 1️⃣ Sortie partielle à +1.5%
+        # --- SORTIE PARTIELLE À +1.5% ---
         if pnl >= 1.5 and not trade["partial_done"]:
             self.send_to_wunder(symbol, "partial_exit", entry, trade["tp"], trade["sl"], trade["ts"])
             trade["sl"] = entry * 1.005 if side == "LONG" else entry * 0.995
             trade["partial_done"] = True
             trade["be_protected"] = True
-            self.send_notif(f"💰 SORTIE 50% ({symbol}) → +1.5% atteint, profit sécurisé +0.5%")
+            self.send_notif(f"💰 PROFIT PARTIEL ({symbol}) → +1.5% encaissé, reste sécurisé.")
             return
 
-        # 2️⃣ Sortie finale si SL touché
+        # --- PROTECTION SL SÉCURISÉ ---
         if trade["be_protected"]:
             if (side == "LONG" and price <= trade["sl"]) or (side == "SHORT" and price >= trade["sl"]):
                 self.send_to_wunder(symbol, "exit", entry, trade["tp"], trade["sl"], trade["ts"])
-                self.send_notif(f"✅ TRADE GAGNANT ({symbol}) → Sortie sécurisée +0.5%")
+                self.send_notif(f"✅ SÉCURITÉ TOUCHÉE ({symbol}) → Sortie à +0.5%")
                 del self.active_trades[symbol]
                 return
 
-        # 3️⃣ TP final 2×ATR
+        # --- TP FINAL 2xATR ---
         if (side == "LONG" and price >= trade["tp"]) or (side == "SHORT" and price <= trade["tp"]):
             self.send_to_wunder(symbol, "exit", entry, trade["tp"], trade["sl"], trade["ts"])
-            self.send_notif(f"🚀 TP ATTEINT ({symbol}) → Objectif 2×ATR atteint")
+            self.send_notif(f"🚀 OBJECTIF ATTEINT ({symbol}) → TP Final Validé")
             del self.active_trades[symbol]
 
     def send_notif(self, msg):
@@ -265,24 +292,19 @@ class QuantisFinal:
         order_type = "limit"
 
         try:
-            balance_info = self.exchange.fetch_balance()
-            usdt_balance = balance_info['total'].get('USDT', 0)
-
+            # Pour WunderTrading, on utilise désormais le montant dynamique défini dans l'interface du bot
             if wunder_action == "partial_exit":
-                amount_usdt = usdt_balance * 0.5
+                amount = "50%" # Demande de fermer 50% de la position actuelle
                 order_type = "market"
                 wunder_action = "exit"
             elif wunder_action == "exit":
-                amount_usdt = usdt_balance
+                amount = "100%" # Demande de fermer la totalité de la position
                 order_type = "market"
             else:
-                amount_usdt = usdt_balance * 0.05
-
-            qty = round(amount_usdt / entry, 6)
-            amount = qty
+                # Pour l'entrée, on laisse WunderTrading utiliser le montant défini dans sa config
+                amount = "100%" 
 
         except Exception as e:
-            print(f"⚠️ Impossible de calculer amount dynamique: {e}")
             amount = "100%"
 
         payload = {
@@ -291,6 +313,7 @@ class QuantisFinal:
             "order_type": order_type,
             "entry_price": entry,
             "amount": amount,
+            "leverage": 1, # Laissé à 1 par défaut, WunderTrading appliquera le levier configuré dans le bot
             "post_only": True if order_type == "limit" else False,
             "take_profit": round(abs(tp-entry)/entry*100,2),
             "stop_loss": round(abs(sl-entry)/entry*100,2),
