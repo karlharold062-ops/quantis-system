@@ -33,11 +33,13 @@ class QuantisFinal:
         # --- CORRECTION 1: Validation Sécurité ---
         self.validate_environment()
         
-        self.exchange = ccxt.bybit({
-            'apiKey': os.getenv("BYBIT_API_KEY"),
-            'secret': os.getenv("BYBIT_API_SECRET"),
+        # CHANGEMENT UNIQUEMENT ICI : Passage à Binance Futures
+        self.exchange = ccxt.binance({
+            'apiKey': os.getenv("BINANCE_API_KEY"),
+            'secret': os.getenv("BINANCE_API_SECRET"),
             'enableRateLimit': True,
-            'timeout': 30000  # Timeout de 30s pour éviter les blocages API
+            'options': {'defaultType': 'future'}, # Obligatoire pour Binance Futures
+            'timeout': 30000  
         })
         self.active_trades = {}
         
@@ -49,7 +51,8 @@ class QuantisFinal:
 
     def validate_environment(self):
         """Vérifie la présence des clés essentielles avant de démarrer"""
-        required = ["BYBIT_API_KEY", "BYBIT_API_SECRET", "WUNDERTRADE_WEBHOOK_URL"]
+        # CHANGEMENT : Noms des variables pour Binance
+        required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL"]
         missing = [var for var in required if not os.getenv(var)]
         if missing:
             msg = f"❌ ERREUR CRITIQUE: Variables manquantes : {missing}"
@@ -331,7 +334,7 @@ class QuantisFinal:
 
 # ===================== DÉMARRAGE =====================
 quantis = QuantisFinal()
-print("✅ Quantis IA Connecté – Futures – Abidjan Time")
+print("✅ Quantis IA Connecté – Binance Futures – Abidjan Time")
 
 while True:
     try:
