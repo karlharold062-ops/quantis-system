@@ -5,17 +5,19 @@ import requests
 import pandas as pd  
 from datetime import datetime  
 import pytz  
-  
+
 # ===================== CONFIGURATION QUANTIS PRO =====================  
 SYMBOLS = ["ETH/USDT"]  
 TIMEZONE = pytz.timezone("Africa/Abidjan")  
 START_HOUR = 13  
 END_HOUR = 22  
 # =====================================================  
-  
+
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")  
 WUNDERTRADE_WEBHOOK = os.getenv("WUNDERTRADE_WEBHOOK_URL")  
-  
+WHALE_ALERT_API = os.getenv("WHALE_ALERT_API")  # ta clé API Whale Alert  
+CRYPTOPANIC_API = os.getenv("CRYPTOPANIC_API")  # ta clé API CryptoPanic  
+
 class QuantisFinal:  
     def __init__(self):  
         self.validate_environment()  
@@ -31,9 +33,9 @@ class QuantisFinal:
         self.max_errors = 5  
         self.circuit_open = False  
         self.report_sent = False  
-  
+
     def validate_environment(self):  
-        required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL"]  
+        required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]  
         missing = [var for var in required if not os.getenv(var)]  
         if missing:  
             msg = f"❌ ERREUR CRITIQUE: Variables manquantes : {missing}"  
@@ -42,7 +44,8 @@ class QuantisFinal:
                 try: requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=5)  
                 except: pass  
             raise EnvironmentError(msg)  
-  
+
+    # --- INDICATEURS TECHNIQUES ---  
     def get_indicators(self, symbol, timeframe='1d'):  
         try:  
             bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)  
@@ -67,31 +70,54 @@ class QuantisFinal:
             print(f"Erreur indicateurs {symbol} [{timeframe}]: {e}")  
             return None  
 
-    # --- SÉCURITÉ 1 : FLASH CRASH (15m) ---
-    def check_flash_crash(self, symbol):
-        try:
-            bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=1)
-            if not bars: return False
-            open_p, current_p = bars[0][1], bars[0][4]
-            change = (current_p - open_p) / open_p * 100
-            direction = self.active_trades[symbol]['dir']
-            if (direction == "LONG" and change <= -1.5) or (direction == "SHORT" and change >= 1.5):
-                return True
-        except: return False
-        return False
+    # --- DONNÉES EXTERNES ---  
+    def get_whale_signal(self):  
+        try:  
+            url = f"https://api.whale-alert.io/v1/transactions?api_key={WHALE_ALERT_API}&min_value=1000000"  
+            resp = requests.get(url, timeout=5).json()  
+            if "transactions" in resp and len(resp["transactions"]) > 0:  
+                total_inflow = sum(tx['amount_usd'] for tx in resp['transactions'] if tx['to']['owner_type']=="exchange")  
+                total_outflow = sum(tx['amount_usd'] for tx in resp['transactions'] if tx['from']['owner_type']=="exchange")  
+                return "bullish" if total_inflow < total_outflow else "bearish"  
+            return "neutral"  
+        except: return "neutral"  
 
-    # --- SÉCURITÉ 2 : GARDIEN DE TENDANCE (1h) ---
-    def check_trend_guard(self, symbol):
-        try:
-            data_1h = self.get_indicators(symbol, timeframe='1h')
-            if not data_1h: return False
-            rsi_1h = data_1h['rsi']
-            direction = self.active_trades[symbol]['dir']
-            if (direction == "LONG" and rsi_1h < 35) or (direction == "SHORT" and rsi_1h > 65):
-                return True
-        except: return False
-        return False
+    def get_cryptopanic_signal(self):  
+        try:  
+            url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_API}&public=true"  
+            resp = requests.get(url, timeout=5).json()  
+            bullish = sum(1 for post in resp.get("results",[]) if post['title'].lower().count("bull")>0)  
+            bearish = sum(1 for post in resp.get("results",[]) if post['title'].lower().count("bear")>0)  
+            if bullish > bearish: return "bullish"  
+            if bearish > bullish: return "bearish"  
+            return "neutral"  
+        except: return "neutral"  
 
+    # --- SÉCURITÉS ---  
+    def check_flash_crash(self, symbol):  
+        try:  
+            bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=1)  
+            if not bars: return False  
+            open_p, current_p = bars[0][1], bars[0][4]  
+            change = (current_p - open_p) / open_p * 100  
+            direction = self.active_trades[symbol]['dir']  
+            if (direction == "LONG" and change <= -1.5) or (direction == "SHORT" and change >= 1.5):  
+                return True  
+        except: return False  
+        return False  
+
+    def check_trend_guard(self, symbol):  
+        try:  
+            data_1h = self.get_indicators(symbol, timeframe='1h')  
+            if not data_1h: return False  
+            rsi_1h = data_1h['rsi']  
+            direction = self.active_trades[symbol]['dir']  
+            if (direction == "LONG" and rsi_1h < 35) or (direction == "SHORT" and rsi_1h > 65):  
+                return True  
+        except: return False  
+        return False  
+
+    # --- STRATÉGIE ---  
     def run_strategy(self):  
         if self.circuit_open:  
             time.sleep(300)  
@@ -105,6 +131,9 @@ class QuantisFinal:
                 self.report_sent = True  
             if now_civ.hour != 13: self.report_sent = False  
 
+            whale_sig = self.get_whale_signal()  
+            news_sig = self.get_cryptopanic_signal()  
+
             for symbol in SYMBOLS:  
                 if symbol in self.active_trades:  
                     self.exit_trade(symbol)  
@@ -115,22 +144,39 @@ class QuantisFinal:
                 data_1d = self.get_indicators(symbol, '1d')  
                 if not data_1d: continue  
 
-                # Correction ici : Suppression du data_1d en trop
-                if data_1d['direction'] == "bullish" and self.analyze_order_book(symbol) == "buy":  
+                # Décision combinée : indicateurs + order book + Whale + CryptoPanic  
+                final_signal = data_1d['direction']  
+                if whale_sig!="neutral": final_signal = whale_sig  
+                if news_sig!="neutral": final_signal = news_sig  
+
+                if final_signal == "bullish" and self.analyze_order_book(symbol) == "buy":  
                     self.enter_trade(symbol, data_1d, "LONG")  
-                elif data_1d['direction'] == "bearish" and self.analyze_order_book(symbol) == "sell":  
+                elif final_signal == "bearish" and self.analyze_order_book(symbol) == "sell":  
                     self.enter_trade(symbol, data_1d, "SHORT")  
         except Exception as e:  
-            print(f"Erreur : {e}")
+            print(f"Erreur : {e}")  
 
+    # --- ORDRES LIMIT ---  
     def enter_trade(self, symbol, data, side):  
         entry = round(data['price'],4)  
         tp = entry + data['atr']*2.0 if side=="LONG" else entry - data['atr']*2.0  
         sl = entry - data['atr']*1.5 if side=="LONG" else entry + data['atr']*1.5  
         self.active_trades[symbol] = {"dir": side, "entry": entry, "tp": tp, "sl": sl, "ts": data['atr']*0.5, "partial_done": False, "be_protected": False}  
+
+        # Place l'ordre limite réel sur Binance Futures  
+        try:  
+            amount = 0.01  # à ajuster selon capital  
+            if side=="LONG":  
+                self.exchange.create_limit_buy_order(symbol, amount, entry)  
+            else:  
+                self.exchange.create_limit_sell_order(symbol, amount, entry)  
+        except Exception as e:  
+            print(f"Erreur ordre limite {symbol}: {e}")  
+
         self.send_notif(f"🎯 ORDRE {side} ({symbol})\nEntrée : {entry}\nTP : {round(abs(tp-entry)/entry*100,2)}% | SL : {round(abs(sl-entry)/entry*100,2)}%")  
         self.send_to_wunder(symbol, side, entry, tp, sl, self.active_trades[symbol]['ts'])  
 
+    # --- SORTIE ---  
     def exit_trade(self, symbol):  
         trade = self.active_trades[symbol]  
         data_now = self.get_indicators(symbol,'1d')  
@@ -138,13 +184,11 @@ class QuantisFinal:
         price, current_rsi = data_now['price'], data_now['rsi']  
         pnl = (price-trade['entry'])/trade['entry']*100 if trade['dir']=="LONG" else (trade['entry']-price)/trade['entry']*100  
 
-        # --- SÉCURITÉS ACTIVÉES ---
-        if self.check_flash_crash(symbol) or self.check_trend_guard(symbol):
-            self.send_to_wunder(symbol,"exit",price,trade["tp"],trade["sl"],trade["ts"])
-            self.send_notif(f"🚨 SÉCURITÉ (Flash/Trend) ({symbol}) → Sortie d'urgence.")
+        if self.check_flash_crash(symbol) or self.check_trend_guard(symbol):  
+            self.send_to_wunder(symbol,"exit",price,trade["tp"],trade["sl"],trade["ts"])  
+            self.send_notif(f"🚨 SÉCURITÉ (Flash/Trend) ({symbol}) → Sortie d'urgence.")  
             del self.active_trades[symbol]; return  
 
-        # --- LOGIQUE NORMALE ---
         if pnl >= 1.5 and not trade["partial_done"]:  
             self.send_to_wunder(symbol,"partial_exit",price,trade["tp"],trade["sl"],trade["ts"])  
             trade["sl"] = trade['entry']*1.005 if trade['dir']=="LONG" else trade['entry']*0.995  
@@ -154,13 +198,13 @@ class QuantisFinal:
 
         if trade["partial_done"] and ((trade['dir']=="LONG" and current_rsi >= 80) or (trade['dir']=="SHORT" and current_rsi <= 20)):  
             self.send_to_wunder(symbol,"exit",price,trade["tp"],trade["sl"],trade["ts"])  
-            self.send_notif(f"📈 Sortie RSI ({symbol}) → RSI={round(current_rsi,2)}") # Correction guillemet faite
+            self.send_notif(f"📈 Sortie RSI ({symbol}) → RSI={round(current_rsi,2)}")  
             del self.active_trades[symbol]; return  
 
         if (trade["be_protected"] and ((trade['dir']=="LONG" and price<=trade["sl"]) or (trade['dir']=="SHORT" and price>=trade["sl"]))) or \
-           ((trade['dir']=="LONG" and price>=trade["tp"]) or (trade['dir']=="SHORT" and price<=trade["tp"])):
-            self.send_to_wunder(symbol,"exit",price,trade["tp"],trade["sl"],trade["ts"])
-            self.send_notif(f"🏁 TRADE FINI ({symbol})"); del self.active_trades[symbol]
+           ((trade['dir']=="LONG" and price>=trade["tp"]) or (trade['dir']=="SHORT" and price<=trade["tp"])):  
+            self.send_to_wunder(symbol,"exit",price,trade["tp"],trade["sl"],trade["ts"])  
+            self.send_notif(f"🏁 TRADE FINI ({symbol})"); del self.active_trades[symbol]  
 
     def analyze_order_book(self, symbol):  
         try:  
@@ -175,7 +219,7 @@ class QuantisFinal:
 
     def send_to_wunder(self,symbol,action,entry,tp,sl,ts):  
         if not WUNDERTRADE_WEBHOOK: return  
-        payload = {"action": action.replace("partial_exit","exit"), "pair": symbol.replace("/",""), "order_type": "market" if "exit" in action else "limit", "entry_price": entry, "amount": "50%" if "partial" in action else "100%", "leverage":1, "take_profit": round(abs(tp-entry)/entry*100,2), "stop_loss": round(abs(sl-entry)/entry*100,2)}  
+        payload = {"action": action.replace("partial_exit","exit"), "pair": symbol.replace("/",""), "order_type": "limit" if "exit" not in action else "market", "entry_price": entry, "amount": "50%" if "partial" in action else "100%", "leverage":1, "take_profit": round(abs(tp-entry)/entry*100,2), "stop_loss": round(abs(sl-entry)/entry*100,2)}  
         requests.post(WUNDERTRADE_WEBHOOK,json=payload,timeout=10)  
 
 quantis = QuantisFinal()  
