@@ -3,12 +3,12 @@ import ccxt
 import time
 import requests
 import pandas as pd
-import threading  # AJOUT: Pour ne pas bloquer le bot lors des envois
+import threading
 from datetime import datetime
 import pytz
 
 # ===================== CONFIGURATION QUANTIS PRO =====================
-SYMBOLS = ["ETH/USDT"]
+SYMBOLS = ["ETH/USDT"]  # Paire Futures sur MEXC
 TIMEZONE = pytz.timezone("Africa/Abidjan")
 START_HOUR = 13
 END_HOUR = 22
@@ -22,22 +22,24 @@ CRYPTOPANIC_API = os.getenv("CRYPTOPANIC_API")
 class QuantisFinal:
     def __init__(self):
         self.validate_environment()
-        self.exchange = ccxt.binance({
-            'apiKey': os.getenv("BINANCE_API_KEY"),
-            'secret': os.getenv("BINANCE_API_SECRET"),
+
+        # --- CONNEXION MEXC (adaptée de Code 1) ---
+        self.exchange = ccxt.mexc({
+            'apiKey': os.getenv("MEXC_API_KEY"),
+            'secret': os.getenv("MEXC_API_SECRET"),
             'enableRateLimit': True,
-            'options': {'defaultType': 'future'},
-            'timeout': 30000
+            'options': {'defaultType': 'swap', 'adjustForTimeDifference': True}
         })
+        
         self.active_trades = {}
-        self.cooldowns = {} # AJOUT: Pour éviter de spammer après une sortie
+        self.cooldowns = {}
         self.error_count = 0
         self.max_errors = 5
         self.circuit_open = False
         self.report_sent = False
 
     def validate_environment(self):
-        required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]
+        required = ["MEXC_API_KEY", "MEXC_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]
         missing = [var for var in required if not os.getenv(var)]
         if missing:
             msg = f"❌ ERREUR CRITIQUE: Variables manquantes : {missing}"
@@ -128,7 +130,6 @@ class QuantisFinal:
         try:
             now_civ = datetime.now(TIMEZONE)
             
-            # Rapport 13H
             if now_civ.hour == 13 and not self.report_sent:
                 data_1d = self.get_indicators(SYMBOLS[0], '1d')
                 if data_1d:
@@ -136,11 +137,9 @@ class QuantisFinal:
                     self.report_sent = True
             if now_civ.hour != 13: self.report_sent = False
 
-            # Gestion des trades existants
             for symbol in list(self.active_trades.keys()):
                 self.manage_active_trade(symbol)
 
-            # Hors horaires
             if not (START_HOUR <= now_civ.hour < END_HOUR): return
 
             whale_sig = self.get_whale_signal()
@@ -172,100 +171,61 @@ class QuantisFinal:
                 self.send_notif("⚠️ Trop d'erreurs, pause de 5 minutes.")
                 self.error_count = 0
 
-    # --- ORDRES LIMIT ---
+    # --- ENVOI DE SIGNALS (PAS D'ORDRES DIRECTS) ---
     def enter_trade(self, symbol, data, side):
         try:
-            open_orders = self.exchange.fetch_open_orders(symbol)
-            if len(open_orders) > 0:
-                print(f"⚠️ Ordre déjà présent sur {symbol}, pas de nouvelle entrée.")
-                return
-        except: pass
-
-        entry = round(data['price'], 4)
-        tp = entry + data['atr'] * 2.0 if side == "LONG" else entry - data['atr'] * 2.0
-        sl = entry - data['atr'] * 1.5 if side == "LONG" else entry + data['atr'] * 1.5
-        
-        self.active_trades[symbol] = {
-            "dir": side, "entry": entry, "tp": tp, "sl": sl, 
-            "ts": data['atr'] * 0.5, "partial_done": False, 
-            "be_protected": False, "status": "PENDING", "order_id": None
-        }
-
-        try:
-            amount = 0.01
-            order = None
-            if side == "LONG":
-                order = self.exchange.create_limit_buy_order(symbol, amount, entry)
-            else:
-                order = self.exchange.create_limit_sell_order(symbol, amount, entry)
+            entry = round(data['price'], 4)
+            tp = entry + data['atr'] * 2.0 if side == "LONG" else entry - data['atr'] * 2.0
+            sl = entry - data['atr'] * 1.5 if side == "LONG" else entry + data['atr'] * 1.5
             
-            if order:
-                self.active_trades[symbol]['order_id'] = order['id']
-                self.send_notif(f"🎯 ORDRE PLACÉ {side} ({symbol})\nEntrée Limit : {entry}\nTP : {round(abs(tp-entry)/entry*100,2)}% | SL : {round(abs(sl-entry)/entry*100,2)}%")
-                self.send_to_wunder(symbol, side, entry, tp, sl, self.active_trades[symbol]['ts'])
-        
-        except Exception as e:
-            print(f"Erreur ordre limite {symbol}: {e}")
-            del self.active_trades[symbol]
+            self.active_trades[symbol] = {
+                "dir": side, "entry": entry, "tp": tp, "sl": sl, 
+                "ts": data['atr'] * 1.0, "partial_done": False, 
+                "be_protected": False, "status": "ACTIVE"
+            }
 
-    # --- GESTION & SORTIE ---
+            self.send_to_wunder(symbol, side, entry, tp, sl, self.active_trades[symbol]['ts'])
+            self.send_notif(f"🎯 SIGNAL {side} ({symbol}) - Entrée : {entry}")
+
+        except Exception as e:
+            print(f"Erreur signal {symbol}: {e}")
+            if symbol in self.active_trades: del self.active_trades[symbol]
+
     def manage_active_trade(self, symbol):
         trade = self.active_trades[symbol]
-        
-        if trade['status'] == "PENDING":
-            try:
-                order_info = self.exchange.fetch_order(trade['order_id'], symbol)
-                if order_info['status'] in ['closed', 'filled']:
-                    trade['status'] = "ACTIVE"
-                    self.send_notif(f"✅ ORDRE REMPLI ({symbol}) - Position Active")
-                elif order_info['status'] == 'canceled':
-                    del self.active_trades[symbol]
-                    return
-                else:
-                    return
-            except Exception as e:
-                print(f"Erreur check order {symbol}: {e}")
-                return
 
         data_now = self.get_indicators(symbol, '1d')
         if not data_now: return
         price, current_rsi = data_now['price'], data_now['rsi']
-        
-        pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir'] == "LONG" else (trade['entry'] - price) / trade['entry'] * 100
 
-        # --- TRAILING STOP DYNAMIQUE BASE SUR ATR ---
-        if trade['status'] == "ACTIVE":
-            atr_trail = data_now['atr'] * 1.0
-            if trade['dir'] == "LONG":
-                new_sl = max(trade['sl'], price - atr_trail)
-                if new_sl != trade['sl']:
-                    trade['sl'] = new_sl
-                    self.send_notif(f"🔹 Trailing SL LONG ajusté à {round(trade['sl'], 4)}")
-            else:
-                new_sl = min(trade['sl'], price + atr_trail)
-                if new_sl != trade['sl']:
-                    trade['sl'] = new_sl
-                    self.send_notif(f"🔹 Trailing SL SHORT ajusté à {round(trade['sl'], 4)}")
+        pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir']=="LONG" else (trade['entry'] - price) / trade['entry'] * 100
+
+        # Trailing ATR
+        atr_trail = data_now['atr'] * 1.0
+        if trade['dir']=="LONG": trade['sl'] = max(trade['sl'], price - atr_trail)
+        else: trade['sl'] = min(trade['sl'], price + atr_trail)
 
         if self.check_flash_crash(symbol) or self.check_trend_guard(symbol):
             self.do_exit(symbol, price, "exit", "🚨 SÉCURITÉ (Flash/Trend)")
             return
 
+        # Partial exit
         if pnl >= 1.5 and not trade["partial_done"]:
             self.send_to_wunder(symbol, "partial_exit", price, trade["tp"], trade["sl"], trade["ts"])
-            trade["sl"] = trade['entry'] * 1.005 if trade['dir'] == "LONG" else trade['entry'] * 0.995
+            trade["sl"] = trade['entry'] * 1.005 if trade['dir']=="LONG" else trade['entry'] * 0.995
             trade["partial_done"] = True
             trade["be_protected"] = True
             self.send_notif(f"💰 PROFIT PARTIEL ({symbol}) → +1.5% encaissé. SL déplacé à BE.")
             return
 
-        if trade["partial_done"] and ((trade['dir'] == "LONG" and current_rsi >= 80) or (trade['dir'] == "SHORT" and current_rsi <= 20)):
+        # RSI exit
+        if trade["partial_done"] and ((trade['dir']=="LONG" and current_rsi >= 80) or (trade['dir']=="SHORT" and current_rsi <= 20)):
             self.do_exit(symbol, price, "exit", f"📈 Sortie RSI ({round(current_rsi,2)})")
             return
 
-        sl_hit = (trade['dir'] == "LONG" and price <= trade["sl"]) or (trade['dir'] == "SHORT" and price >= trade["sl"])
-        tp_hit = (trade['dir'] == "LONG" and price >= trade["tp"]) or (trade['dir'] == "SHORT" and price <= trade["tp"])
-
+        # TP/SL exit
+        sl_hit = (trade['dir']=="LONG" and price <= trade["sl"]) or (trade['dir']=="SHORT" and price >= trade["sl"])
+        tp_hit = (trade['dir']=="LONG" and price >= trade["tp"]) or (trade['dir']=="SHORT" and price <= trade["tp"])
         if sl_hit or tp_hit:
             reason = "🏁 TP TOUCHÉ" if tp_hit else "🛑 SL TOUCHÉ"
             self.do_exit(symbol, price, "exit", reason)
@@ -287,8 +247,7 @@ class QuantisFinal:
     # --- NOTIFICATIONS ---
     def send_notif(self, msg):
         print(msg)
-        if DISCORD_WEBHOOK:
-            threading.Thread(target=self._send_discord_thread, args=(msg,)).start()
+        if DISCORD_WEBHOOK: threading.Thread(target=self._send_discord_thread, args=(msg,)).start()
 
     def _send_discord_thread(self, msg):
         try: requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=5)
@@ -301,21 +260,20 @@ class QuantisFinal:
     def _send_wunder_thread(self, symbol, action, entry, tp, sl, ts):
         try:
             payload = {
-                "action": action.replace("partial_exit", "exit"),
-                "pair": symbol.replace("/", ""),
-                "order_type": "limit" if "exit" not in action else "market",
+                "action": action.replace("partial_exit","exit"),
+                "pair": symbol.replace("/",""),
+                "order_type": "market",
                 "entry_price": entry,
-                "amount": "50%" if "partial" in action else "100%",
-                "leverage": 1,
-                "take_profit": round(abs(tp - entry) / entry * 100, 2),
-                "stop_loss": round(abs(sl - entry) / entry * 100, 2)
+                "amount": "100%",
+                "take_profit": round(abs(tp-entry)/entry*100,2),
+                "stop_loss": round(abs(sl-entry)/entry*100,2)
             }
             requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=10)
-        except Exception as e:
-            print(f"Erreur Wunder: {e}")
+        except Exception as e: print(f"Erreur Wunder: {e}")
 
+# --- DÉMARRAGE BOT ---
 quantis = QuantisFinal()
-print("🤖 QUANTIS PRO DÉMARRÉ - Mode Sécurisé")
+print("🤖 QUANTIS PRO DÉMARRÉ - Mode Signaux uniquement sur MEXC")
 while True:
     quantis.run_strategy()
     time.sleep(30)
