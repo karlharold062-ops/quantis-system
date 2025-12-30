@@ -8,7 +8,7 @@ from datetime import datetime
 import pytz
 
 # ===================== CONFIGURATION QUANTIS PRO =====================
-SYMBOLS = ["ETH/USDT"]  # Paire Futures sur MEXC
+SYMBOLS = ["ETH/USDT"]  # Paire Futures sur Binance
 TIMEZONE = pytz.timezone("Africa/Abidjan")
 START_HOUR = 13
 END_HOUR = 22
@@ -23,12 +23,12 @@ class QuantisFinal:
     def __init__(self):
         self.validate_environment()
 
-        # --- CONNEXION MEXC (adaptée de Code 1) ---
-        self.exchange = ccxt.mexc({
-            'apiKey': os.getenv("MEXC_API_KEY"),
-            'secret': os.getenv("MEXC_API_SECRET"),
+        # --- CONNEXION BINANCE FUTURES ---
+        self.exchange = ccxt.binance({
+            'apiKey': os.getenv("BINANCE_API_KEY"),
+            'secret': os.getenv("BINANCE_API_SECRET"),
             'enableRateLimit': True,
-            'options': {'defaultType': 'swap', 'adjustForTimeDifference': True}
+            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
         })
         
         self.active_trades = {}
@@ -39,7 +39,7 @@ class QuantisFinal:
         self.report_sent = False
 
     def validate_environment(self):
-        required = ["MEXC_API_KEY", "MEXC_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]
+        required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]
         missing = [var for var in required if not os.getenv(var)]
         if missing:
             msg = f"❌ ERREUR CRITIQUE: Variables manquantes : {missing}"
@@ -273,7 +273,7 @@ class QuantisFinal:
 
 # --- DÉMARRAGE BOT ---
 quantis = QuantisFinal()
-print("🤖 QUANTIS PRO DÉMARRÉ - Mode Signaux uniquement sur MEXC")
+print("🤖 QUANTIS PRO DÉMARRÉ - Mode Signaux uniquement sur BINANCE FUTURES")
 while True:
     quantis.run_strategy()
     time.sleep(30)
