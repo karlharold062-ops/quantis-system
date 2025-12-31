@@ -18,15 +18,15 @@ WUNDERTRADE_WEBHOOK = os.getenv("WUNDERTRADE_WEBHOOK_URL")
 WHALE_ALERT_API = os.getenv("WHALE_ALERT_API")
 CRYPTOPANIC_API = os.getenv("CRYPTOPANIC_API")
 
-# --- DÉCORATEUR DE RECONNEXION AUTO ---
+# --- DÉCORATEUR DE RECONNEXION AUTO (ANTI-CRASH) ---
 def retry_api(func):
     def wrapper(*args, **kwargs):
-        for i in range(3):  # 3 tentatives
+        for i in range(3):
             try:
                 return func(*args, **kwargs)
             except (ccxt.NetworkError, ccxt.ExchangeError, ccxt.RateLimitExceeded) as e:
                 print(f"⚠️ Erreur API (Tentative {i+1}/3): {e}")
-                time.sleep(5)  # Pause avant reconnexion
+                time.sleep(5)
         return None
     return wrapper
 
@@ -40,7 +40,6 @@ class QuantisFinal:
         self.error_count = 0
         self.max_errors = 5
         self.circuit_open = False
-        self.report_sent = False
 
     def connect_exchange(self):
         self.exchange = ccxt.binance({
@@ -56,7 +55,6 @@ class QuantisFinal:
         if missing:
             raise EnvironmentError(f"❌ Variables manquantes : {missing}")
 
-    # --- INDICATEURS TECHNIQUES AVEC AUTO-RETRY ---
     @retry_api
     def get_indicators(self, symbol, timeframe='1d'):
         bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
@@ -77,7 +75,7 @@ class QuantisFinal:
             "direction": direction
         }
 
-    # --- SÉCURITÉ FLASH CRASH ---
+    # --- SÉCURITÉ FLASH CRASH (RÉGLÉ À 3% POUR ZEC) ---
     @retry_api
     def check_flash_crash(self, symbol):
         bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=2)
@@ -87,7 +85,8 @@ class QuantisFinal:
         change = (current_price - last_open) / last_open * 100
         
         direction = self.active_trades[symbol]['dir']
-        if (direction == "LONG" and change <= -1.5) or (direction == "SHORT" and change >= 1.5):
+        # ✅ Mis à 3.0 pour encaisser la volatilité du ZEC
+        if (direction == "LONG" and change <= -3.0) or (direction == "SHORT" and change >= 3.0):
             return True
         return False
 
@@ -100,10 +99,10 @@ class QuantisFinal:
         try:
             now_civ = datetime.now(TIMEZONE)
             
-            # --- FERMETURE 23H59 ---
+            # --- FERMETURE FIN DE JOURNÉE (23h59) ---
             if now_civ.hour == 23 and now_civ.minute == 59:
                 for symbol in list(self.active_trades.keys()):
-                    self.do_exit(symbol, self.active_trades[symbol]['entry'], "exit", "⏰ FIN DE JOURNÉE 23H59")
+                    self.do_exit(symbol, self.active_trades[symbol]['entry'], "exit", "⏰ FERMETURE 23H59")
                 return
 
             for symbol in list(self.active_trades.keys()):
@@ -134,7 +133,9 @@ class QuantisFinal:
         try:
             entry = round(data['price'], 4)
             atr = data['atr']
+            # TP Dynamique (ATR * 2)
             tp = entry + (atr * 2.0) if side == "LONG" else entry - (atr * 2.0)
+            # SL Dynamique (ATR * 1.5)
             sl = entry - (atr * 1.5) if side == "LONG" else entry + (atr * 1.5)
             
             self.active_trades[symbol] = {
@@ -142,7 +143,7 @@ class QuantisFinal:
                 "ts_mult": 1.5, "partial_done": False
             }
             self.send_to_wunder(symbol, side, entry, tp, sl, atr * 1.5)
-            self.send_notif(f"🎯 SIGNAL {side} {symbol} | Reconnect Auto OK")
+            self.send_notif(f"🎯 SIGNAL {side} {symbol} | SL/TP ATR actifs")
         except: pass
 
     def manage_active_trade(self, symbol):
@@ -154,16 +155,16 @@ class QuantisFinal:
         atr_trail_dist = data_now['atr'] * trade["ts_mult"]
 
         if self.check_flash_crash(symbol):
-            self.do_exit(symbol, price, "exit", "🚨 FLASH CRASH")
+            self.do_exit(symbol, price, "exit", "🚨 FLASH CRASH (3%)")
             return
 
-        # TRAILING ATR PERMANENT
+        # --- TRAILING ATR PERMANENT (S'ACTUALISE TOUT LE TEMPS) ---
         if trade['dir'] == "LONG":
             if price - atr_trail_dist > trade["sl"]: trade["sl"] = price - atr_trail_dist
         else:
             if price + atr_trail_dist < trade["sl"]: trade["sl"] = price + atr_trail_dist
 
-        # SÉCURISATION +1%
+        # --- SÉCURISATION +1% ---
         pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir']=="LONG" else (trade['entry'] - price) / trade['entry'] * 100
         if pnl >= 1.0 and not trade["partial_done"]:
             self.send_to_wunder(symbol, "partial_exit", price, trade["tp"], trade["sl"], atr_trail_dist, amount="10%")
@@ -172,11 +173,12 @@ class QuantisFinal:
             trade["partial_done"] = True
             self.send_notif(f"💰 +1% sécurisé sur {symbol}")
 
+        # --- SORTIE SL / TP / TRAILING ---
         sl_hit = (trade['dir']=="LONG" and price <= trade["sl"]) or (trade['dir']=="SHORT" and price >= trade["sl"])
         tp_hit = (trade['dir']=="LONG" and price >= trade["tp"]) or (trade['dir']=="SHORT" and price <= trade["tp"])
         
         if sl_hit or tp_hit:
-            reason = "🏁 TP ATTEINT" if tp_hit else "🛡️ TRAILING SL"
+            reason = "🏁 TP ATTEINT" if tp_hit else "🛡️ TRAILING SL TOUCHÉ"
             self.do_exit(symbol, price, "exit", reason)
 
     def do_exit(self, symbol, price, action, reason):
@@ -220,8 +222,7 @@ class QuantisFinal:
 
 # --- DÉMARRAGE ---
 quantis = QuantisFinal()
-print("🤖 QUANTIS PRO DÉMARRÉ - Mode Ultra-Résilient")
+print("🤖 QUANTIS PRO DÉMARRÉ - Mode Ultra-Résilient ZEC 3%")
 while True:
     quantis.run_strategy()
     time.sleep(30)
-
