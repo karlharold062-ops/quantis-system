@@ -59,17 +59,19 @@ class QuantisFinal:
     def get_indicators(self, symbol, timeframe='1d'):
         bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
         df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
-        typical_price = (df['h'] + df['l'] + df['c']) / 3
-        df['vwap'] = (typical_price * df['v']).cumsum() / df['v'].cumsum()
+        
+        # --- REMPLACEMENT VWAP PAR EMA 20 ---
+        df['ema20'] = df['c'].ewm(span=20, adjust=False).mean()
+        
         df['tr'] = df[['h','l','c']].apply(lambda x: max(x.iloc[0]-x.iloc[1], abs(x.iloc[0]-x.iloc[2]), abs(x.iloc[1]-x.iloc[2])), axis=1)
         df['atr'] = df['tr'].rolling(14).mean()
         
         impulse = df['c'].iloc[-1] > df['c'].iloc[-2] and df['v'].iloc[-1] > df['v'].iloc[-2]
-        direction = "bullish" if df['c'].iloc[-1] > df['vwap'].iloc[-1] else "bearish"
+        direction = "bullish" if df['c'].iloc[-1] > df['ema20'].iloc[-1] else "bearish"
         
         return {
             "price": df['c'].iloc[-1],
-            "vwap": df['vwap'].iloc[-1],
+            "ema20": df['ema20'].iloc[-1],
             "atr": df['atr'].iloc[-1],
             "impulse": impulse,
             "direction": direction
@@ -222,7 +224,7 @@ class QuantisFinal:
 
 # --- DÉMARRAGE ---
 quantis = QuantisFinal()
-print("🤖 QUANTIS PRO DÉMARRÉ - Mode Ultra-Résilient ZEC 3%")
+print("🤖 QUANTIS PRO DÉMARRÉ - Mode Ultra-Résilient ZEC (EMA 20)")
 while True:
     quantis.run_strategy()
     time.sleep(30)
