@@ -6,25 +6,44 @@ import pandas as pd
 import threading  
 from datetime import datetime  
 import pytz  
-  
-# ✅ LIGNE AJOUTÉE POUR TROUVER TON IP SUR RENDER (CORRIGÉE)  
-try:  
-    ip_render = requests.get('https://api.ipify.org', timeout=10).text  
-    print(f"🌐 MON IP RENDER : {ip_render}")  
-except Exception as e:  
-    print("🌐 Impossible de récupérer l'IP pour le moment :", e)  
-  
+
+# ================= TEST CONNEXION BINANCE =================
+# Ce bloc doit être tout au début, avant ton code Quantis
+print("🤖 BOT DEMARRÉ")
+
+# Affiche l'IP Render
+try:
+    ip_render = requests.get('https://api.ipify.org', timeout=10).text
+    print("🌐 IP RENDER :", ip_render)
+except Exception as e:
+    print("❌ Impossible de récupérer l'IP :", e)
+
+# Test connexion Binance
+exchange_test = ccxt.binance({
+    'apiKey': os.getenv("BINANCE_API_KEY"),
+    'secret': os.getenv("BINANCE_API_SECRET"),
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'}  # 'spot' si tu lis juste les prix Spot
+})
+
+try:
+    ticker = exchange_test.fetch_ticker("ZEC/USDT")
+    print("✅ Connexion Binance OK - Prix ZEC/USDT :", ticker['last'])
+except Exception as e:
+    print("❌ Erreur connexion Binance :", e)
+# ==========================================================
+
 # ===================== CONFIGURATION QUANTIS PRO =====================  
 SYMBOLS = ["ZEC/USDT"]   
 TIMEZONE = pytz.timezone("Africa/Abidjan")  
 START_HOUR = 12   
 # =====================================================  
-  
+
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")  
 WUNDERTRADE_WEBHOOK = os.getenv("WUNDERTRADE_WEBHOOK_URL")  
 WHALE_ALERT_API = os.getenv("WHALE_ALERT_API")  
 CRYPTOPANIC_API = os.getenv("CRYPTOPANIC_API")  
-  
+
 def retry_api(func):  
     def wrapper(*args, **kwargs):  
         for i in range(3):  
@@ -35,7 +54,7 @@ def retry_api(func):
                 time.sleep(5)  
         return None  
     return wrapper  
-  
+
 class QuantisFinal:  
     def __init__(self):  
         self.validate_environment()  
@@ -45,7 +64,7 @@ class QuantisFinal:
         self.error_count = 0  
         self.max_errors = 5  
         self.circuit_open = False  
-  
+
     def connect_exchange(self):  
         self.exchange = ccxt.binance({  
             'apiKey': os.getenv("BINANCE_API_KEY"),  
@@ -53,13 +72,13 @@ class QuantisFinal:
             'enableRateLimit': True,  
             'options': {'defaultType': 'future', 'adjustForTimeDifference': True}  
         })  
-  
+
     def validate_environment(self):  
         required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]  
         missing = [var for var in required if not os.getenv(var)]  
         if missing:  
             print(f"❌ Variables manquantes : {missing}")  
-  
+
     @retry_api  
     def get_indicators(self, symbol, timeframe='1d'):  
         bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)  
@@ -70,7 +89,7 @@ class QuantisFinal:
         impulse = df['c'].iloc[-1] > df['c'].iloc[-2] and df['v'].iloc[-1] > df['v'].iloc[-2]  
         direction = "bullish" if df['c'].iloc[-1] > df['ema20'].iloc[-1] else "bearish"  
         return {"price": df['c'].iloc[-1], "ema20": df['ema20'].iloc[-1], "atr": df['atr'].iloc[-1], "impulse": impulse, "direction": direction}  
-  
+
     @retry_api  
     def check_flash_crash(self, symbol):  
         bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=2)  
@@ -82,7 +101,7 @@ class QuantisFinal:
         if (direction == "LONG" and change <= -3.0) or (direction == "SHORT" and change >= 3.0):  
             return True  
         return False  
-  
+
     def run_strategy(self):  
         if self.circuit_open:  
             time.sleep(300)  
@@ -113,7 +132,7 @@ class QuantisFinal:
             if self.error_count > self.max_errors:  
                 self.circuit_open = True  
                 self.error_count = 0  
-  
+
     def enter_trade(self, symbol, data, side):  
         try:  
             entry = round(data['price'], 4)  
@@ -124,7 +143,7 @@ class QuantisFinal:
             self.send_to_wunder(symbol, side, entry, tp, sl, atr * 1.5)  
             self.send_notif(f"🎯 SIGNAL {side} {symbol} | ATR: {round(atr, 4)}")  
         except: pass  
-  
+
     def manage_active_trade(self, symbol):  
         trade = self.active_trades[symbol]  
         data_now = self.get_indicators(symbol, '1d')  
@@ -153,32 +172,32 @@ class QuantisFinal:
         sl_hit = (trade['dir']=="LONG" and price <= trade["sl"]) or (trade['dir']=="SHORT" and price >= trade["sl"])  
         if sl_hit:  
             self.do_exit(symbol, price, "exit", "🛡️ TRAILING SL/TP TOUCHÉ")  
-  
+
     def do_exit(self, symbol, price, action, reason):  
         trade = self.active_trades[symbol]  
         self.send_to_wunder(symbol, action, price, trade["tp"], trade["sl"], 0)  
         self.send_notif(f"{reason} ({symbol})")  
         if symbol in self.active_trades: del self.active_trades[symbol]  
         self.cooldowns[symbol] = time.time()  
-  
+
     @retry_api  
     def analyze_order_book(self, symbol):  
         ob = self.exchange.fetch_order_book(symbol)  
         bids, asks = sum(b[1] for b in ob['bids'][:10]), sum(a[1] for a in ob['asks'][:10])  
         return "buy" if bids > asks * 1.2 else "sell" if asks > bids * 1.2 else "neutral"  
-  
+
     def send_notif(self, msg):  
         print(msg)  
         if DISCORD_WEBHOOK: threading.Thread(target=self._send_discord_thread, args=(msg,)).start()  
-  
+
     def _send_discord_thread(self, msg):  
         try: requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=5)  
         except: pass  
-  
+
     def send_to_wunder(self, symbol, action, entry, tp, sl, ts, amount="100%"):  
         if not WUNDERTRADE_WEBHOOK: return  
         threading.Thread(target=self._send_wunder_thread, args=(symbol, action, entry, tp, sl, ts, amount)).start()  
-  
+
     def _send_wunder_thread(self, symbol, action, entry, tp, sl, ts, amount):  
         try:  
             payload = {  
@@ -186,14 +205,14 @@ class QuantisFinal:
                 "pair": symbol.replace("/",""),  
                 "order_type": "market",  
                 "entry_price": entry,  
-                "amount": amount, # Utilise 100% du capital disponible (Réinvestissement total)  
-                "leverage": 25,   # ✅ Ajout du levier x25  
+                "amount": amount,  
+                "leverage": 25,  
                 "take_profit": round(abs(tp-entry)/entry*100,2) if entry != 0 else 0,  
                 "stop_loss": round(abs(sl-entry)/entry*100,2) if entry != 0 else 0  
             }  
             requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=10)  
         except: pass  
-  
+
 quantis = QuantisFinal()  
 print("🤖 QUANTIS PRO DÉMARRÉ - 12H - EMA 20 - ATR CONDITION - LEVIER X25")  
 while True:  
