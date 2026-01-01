@@ -7,10 +7,16 @@ import threading
 from datetime import datetime
 import pytz
 
+# ✅ LIGNE AJOUTÉE POUR TROUVER TON IP SUR RENDER
+try:
+    print(f"🌐 MON IP RENDER : {requests.get('https://api.ipify.org').text}")
+except:
+    print("🌐 Impossible de récupérer l'IP pour le moment")
+
 # ===================== CONFIGURATION QUANTIS PRO =====================
 SYMBOLS = ["ZEC/USDT"] 
 TIMEZONE = pytz.timezone("Africa/Abidjan")
-START_HOUR = 12  # ✅ 12h comme demandé
+START_HOUR = 12 
 # =====================================================
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
@@ -18,7 +24,6 @@ WUNDERTRADE_WEBHOOK = os.getenv("WUNDERTRADE_WEBHOOK_URL")
 WHALE_ALERT_API = os.getenv("WHALE_ALERT_API")
 CRYPTOPANIC_API = os.getenv("CRYPTOPANIC_API")
 
-# --- DÉCORATEUR DE RECONNEXION AUTO (ANTI-CRASH) ---
 def retry_api(func):
     def wrapper(*args, **kwargs):
         for i in range(3):
@@ -34,7 +39,6 @@ class QuantisFinal:
     def __init__(self):
         self.validate_environment()
         self.connect_exchange()
-        
         self.active_trades = {}
         self.cooldowns = {}
         self.error_count = 0
@@ -53,31 +57,19 @@ class QuantisFinal:
         required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]
         missing = [var for var in required if not os.getenv(var)]
         if missing:
-            raise EnvironmentError(f"❌ Variables manquantes : {missing}")
+            print(f"❌ Variables manquantes : {missing}")
 
     @retry_api
     def get_indicators(self, symbol, timeframe='1d'):
         bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
         df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
-        
-        # --- EMA 20 ---
         df['ema20'] = df['c'].ewm(span=20, adjust=False).mean()
-        
         df['tr'] = df[['h','l','c']].apply(lambda x: max(x.iloc[0]-x.iloc[1], abs(x.iloc[0]-x.iloc[2]), abs(x.iloc[1]-x.iloc[2])), axis=1)
         df['atr'] = df['tr'].rolling(14).mean()
-        
         impulse = df['c'].iloc[-1] > df['c'].iloc[-2] and df['v'].iloc[-1] > df['v'].iloc[-2]
         direction = "bullish" if df['c'].iloc[-1] > df['ema20'].iloc[-1] else "bearish"
-        
-        return {
-            "price": df['c'].iloc[-1],
-            "ema20": df['ema20'].iloc[-1],
-            "atr": df['atr'].iloc[-1],
-            "impulse": impulse,
-            "direction": direction
-        }
+        return {"price": df['c'].iloc[-1], "ema20": df['ema20'].iloc[-1], "atr": df['atr'].iloc[-1], "impulse": impulse, "direction": direction}
 
-    # --- SÉCURITÉ FLASH CRASH (RÉGLÉ À 3% POUR ZEC) ---
     @retry_api
     def check_flash_crash(self, symbol):
         bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=2)
@@ -85,7 +77,6 @@ class QuantisFinal:
         last_open = bars[-1][1]
         current_price = bars[-1][4]
         change = (current_price - last_open) / last_open * 100
-        
         direction = self.active_trades[symbol]['dir']
         if (direction == "LONG" and change <= -3.0) or (direction == "SHORT" and change >= 3.0):
             return True
@@ -96,36 +87,25 @@ class QuantisFinal:
             time.sleep(300)
             self.circuit_open = False
             return
-            
         try:
             now_civ = datetime.now(TIMEZONE)
-            
-            # --- FERMETURE FIN DE JOURNÉE (23h59) ---
             if now_civ.hour == 23 and now_civ.minute == 59:
                 for symbol in list(self.active_trades.keys()):
                     self.do_exit(symbol, self.active_trades[symbol]['entry'], "exit", "⏰ FERMETURE 23H59")
                 return
-
             for symbol in list(self.active_trades.keys()):
                 self.manage_active_trade(symbol)
-
             if now_civ.hour < START_HOUR: return
-
             for symbol in SYMBOLS:
                 if symbol in self.active_trades: continue
                 if symbol in self.cooldowns and (time.time() - self.cooldowns[symbol] < 300): continue
-
                 data_1d = self.get_indicators(symbol, '1d')
-                
-                # ✅ CONDITION D'ENTRÉE AVEC ATR AJOUTÉ :
-                # On vérifie que data_1d existe, qu'il y a une impulsion, ET que l'ATR est valide (>0)
                 if data_1d and data_1d["impulse"] and data_1d["atr"] > 0:
                     ob_analysis = self.analyze_order_book(symbol)
                     if data_1d['direction'] == "bullish" and ob_analysis == "buy":
                         self.enter_trade(symbol, data_1d, "LONG")
                     elif data_1d['direction'] == "bearish" and ob_analysis == "sell":
                         self.enter_trade(symbol, data_1d, "SHORT")
-                    
         except Exception as e:
             print(f"Erreur Loop: {e}")
             self.error_count += 1
@@ -139,11 +119,7 @@ class QuantisFinal:
             atr = data['atr']
             tp = entry + (atr * 2.0) if side == "LONG" else entry - (atr * 2.0)
             sl = entry - (atr * 1.5) if side == "LONG" else entry + (atr * 1.5)
-            
-            self.active_trades[symbol] = {
-                "dir": side, "entry": entry, "tp": tp, "sl": sl, 
-                "ts_mult": 1.5, "partial_done": False, "trailing_tp_active": False
-            }
+            self.active_trades[symbol] = {"dir": side, "entry": entry, "tp": tp, "sl": sl, "ts_mult": 1.5, "partial_done": False, "trailing_tp_active": False}
             self.send_to_wunder(symbol, side, entry, tp, sl, atr * 1.5)
             self.send_notif(f"🎯 SIGNAL {side} {symbol} | ATR: {round(atr, 4)}")
         except: pass
@@ -152,21 +128,15 @@ class QuantisFinal:
         trade = self.active_trades[symbol]
         data_now = self.get_indicators(symbol, '1d')
         if not data_now: return
-        
         price = data_now['price']
         atr_trail_dist = data_now['atr'] * trade["ts_mult"]
-
         if self.check_flash_crash(symbol):
             self.do_exit(symbol, price, "exit", "🚨 FLASH CRASH (3%)")
             return
-
-        # --- TRAILING ATR PERMANENT ---
         if trade['dir'] == "LONG":
             if price - atr_trail_dist > trade["sl"]: trade["sl"] = price - atr_trail_dist
         else:
             if price + atr_trail_dist < trade["sl"]: trade["sl"] = price + atr_trail_dist
-
-        # --- SÉCURISATION +1% ---
         pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir']=="LONG" else (trade['entry'] - price) / trade['entry'] * 100
         if pnl >= 1.0 and not trade["partial_done"]:
             self.send_to_wunder(symbol, "partial_exit", price, trade["tp"], trade["sl"], atr_trail_dist, amount="10%")
@@ -174,20 +144,14 @@ class QuantisFinal:
             else: trade["sl"] = min(trade["sl"], trade['entry'])
             trade["partial_done"] = True
             self.send_notif(f"💰 +1% sécurisé sur {symbol}")
-
-        # --- LOGIQUE TRAILING TAKE PROFIT ---
         tp_reached = (trade['dir']=="LONG" and price >= trade["tp"]) or (trade['dir']=="SHORT" and price <= trade["tp"])
         if tp_reached and not trade["trailing_tp_active"]:
             trade["trailing_tp_active"] = True
             trade["ts_mult"] = 0.5 
             self.send_notif(f"🚀 TP ATTEINT : Trailing Profit Activé !")
-
-        # --- SORTIE FINALE ---
         sl_hit = (trade['dir']=="LONG" and price <= trade["sl"]) or (trade['dir']=="SHORT" and price >= trade["sl"])
-        
         if sl_hit:
-            reason = "🛡️ TRAILING SL/TP TOUCHÉ"
-            self.do_exit(symbol, price, "exit", reason)
+            self.do_exit(symbol, price, "exit", "🛡️ TRAILING SL/TP TOUCHÉ")
 
     def do_exit(self, symbol, price, action, reason):
         trade = self.active_trades[symbol]
@@ -228,7 +192,6 @@ class QuantisFinal:
             requests.post(WUNDERTRADE_WEBHOOK, json=payload, timeout=10)
         except: pass
 
-# --- DÉMARRAGE ---
 quantis = QuantisFinal()
 print("🤖 QUANTIS PRO DÉMARRÉ - 12H - EMA 20 - ATR CONDITION")
 while True:
