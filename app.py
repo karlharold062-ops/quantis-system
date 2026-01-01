@@ -185,7 +185,8 @@ class QuantisFinal:
                 "pair": symbol.replace("/",""),
                 "order_type": "market",
                 "entry_price": entry,
-                "amount": amount,
+                "amount": amount, # Utilise 100% du capital disponible (Réinvestissement total)
+                "leverage": 25,   # ✅ Ajout du levier x25
                 "take_profit": round(abs(tp-entry)/entry*100,2) if entry != 0 else 0,
                 "stop_loss": round(abs(sl-entry)/entry*100,2) if entry != 0 else 0
             }
@@ -193,7 +194,8 @@ class QuantisFinal:
         except: pass
 
 quantis = QuantisFinal()
-print("🤖 QUANTIS PRO DÉMARRÉ - 12H - EMA 20 - ATR CONDITION")
+print("🤖 QUANTIS PRO DÉMARRÉ - 12H - EMA 20 - ATR CONDITION - LEVIER X25")
 while True:
     quantis.run_strategy()
     time.sleep(30)
+
