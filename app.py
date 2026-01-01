@@ -10,7 +10,7 @@ import pytz
 # ===================== CONFIGURATION QUANTIS PRO =====================
 SYMBOLS = ["ZEC/USDT"] 
 TIMEZONE = pytz.timezone("Africa/Abidjan")
-START_HOUR = 13
+START_HOUR = 12  # ✅ 12h comme demandé
 # =====================================================
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
@@ -60,7 +60,7 @@ class QuantisFinal:
         bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
         df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
         
-        # --- REMPLACEMENT VWAP PAR EMA 20 ---
+        # --- EMA 20 ---
         df['ema20'] = df['c'].ewm(span=20, adjust=False).mean()
         
         df['tr'] = df[['h','l','c']].apply(lambda x: max(x.iloc[0]-x.iloc[1], abs(x.iloc[0]-x.iloc[2]), abs(x.iloc[1]-x.iloc[2])), axis=1)
@@ -87,7 +87,6 @@ class QuantisFinal:
         change = (current_price - last_open) / last_open * 100
         
         direction = self.active_trades[symbol]['dir']
-        # ✅ Mis à 3.0 pour encaisser la volatilité du ZEC
         if (direction == "LONG" and change <= -3.0) or (direction == "SHORT" and change >= 3.0):
             return True
         return False
@@ -117,7 +116,10 @@ class QuantisFinal:
                 if symbol in self.cooldowns and (time.time() - self.cooldowns[symbol] < 300): continue
 
                 data_1d = self.get_indicators(symbol, '1d')
-                if data_1d and data_1d["impulse"]:
+                
+                # ✅ CONDITION D'ENTRÉE AVEC ATR AJOUTÉ :
+                # On vérifie que data_1d existe, qu'il y a une impulsion, ET que l'ATR est valide (>0)
+                if data_1d and data_1d["impulse"] and data_1d["atr"] > 0:
                     ob_analysis = self.analyze_order_book(symbol)
                     if data_1d['direction'] == "bullish" and ob_analysis == "buy":
                         self.enter_trade(symbol, data_1d, "LONG")
@@ -135,17 +137,15 @@ class QuantisFinal:
         try:
             entry = round(data['price'], 4)
             atr = data['atr']
-            # TP Dynamique (ATR * 2)
             tp = entry + (atr * 2.0) if side == "LONG" else entry - (atr * 2.0)
-            # SL Dynamique (ATR * 1.5)
             sl = entry - (atr * 1.5) if side == "LONG" else entry + (atr * 1.5)
             
             self.active_trades[symbol] = {
                 "dir": side, "entry": entry, "tp": tp, "sl": sl, 
-                "ts_mult": 1.5, "partial_done": False
+                "ts_mult": 1.5, "partial_done": False, "trailing_tp_active": False
             }
             self.send_to_wunder(symbol, side, entry, tp, sl, atr * 1.5)
-            self.send_notif(f"🎯 SIGNAL {side} {symbol} | SL/TP ATR actifs")
+            self.send_notif(f"🎯 SIGNAL {side} {symbol} | ATR: {round(atr, 4)}")
         except: pass
 
     def manage_active_trade(self, symbol):
@@ -160,7 +160,7 @@ class QuantisFinal:
             self.do_exit(symbol, price, "exit", "🚨 FLASH CRASH (3%)")
             return
 
-        # --- TRAILING ATR PERMANENT (S'ACTUALISE TOUT LE TEMPS) ---
+        # --- TRAILING ATR PERMANENT ---
         if trade['dir'] == "LONG":
             if price - atr_trail_dist > trade["sl"]: trade["sl"] = price - atr_trail_dist
         else:
@@ -175,12 +175,18 @@ class QuantisFinal:
             trade["partial_done"] = True
             self.send_notif(f"💰 +1% sécurisé sur {symbol}")
 
-        # --- SORTIE SL / TP / TRAILING ---
+        # --- LOGIQUE TRAILING TAKE PROFIT ---
+        tp_reached = (trade['dir']=="LONG" and price >= trade["tp"]) or (trade['dir']=="SHORT" and price <= trade["tp"])
+        if tp_reached and not trade["trailing_tp_active"]:
+            trade["trailing_tp_active"] = True
+            trade["ts_mult"] = 0.5 
+            self.send_notif(f"🚀 TP ATTEINT : Trailing Profit Activé !")
+
+        # --- SORTIE FINALE ---
         sl_hit = (trade['dir']=="LONG" and price <= trade["sl"]) or (trade['dir']=="SHORT" and price >= trade["sl"])
-        tp_hit = (trade['dir']=="LONG" and price >= trade["tp"]) or (trade['dir']=="SHORT" and price <= trade["tp"])
         
-        if sl_hit or tp_hit:
-            reason = "🏁 TP ATTEINT" if tp_hit else "🛡️ TRAILING SL TOUCHÉ"
+        if sl_hit:
+            reason = "🛡️ TRAILING SL/TP TOUCHÉ"
             self.do_exit(symbol, price, "exit", reason)
 
     def do_exit(self, symbol, price, action, reason):
@@ -224,7 +230,7 @@ class QuantisFinal:
 
 # --- DÉMARRAGE ---
 quantis = QuantisFinal()
-print("🤖 QUANTIS PRO DÉMARRÉ - Mode Ultra-Résilient ZEC (EMA 20)")
+print("🤖 QUANTIS PRO DÉMARRÉ - 12H - EMA 20 - ATR CONDITION")
 while True:
     quantis.run_strategy()
     time.sleep(30)
