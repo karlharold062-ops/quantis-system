@@ -42,6 +42,9 @@ class QuantisFinal:
         self.max_errors = 5
         self.circuit_open = False
 
+        # Notification de démarrage
+        self.send_notif("🤖 QUANTIS PRO DÉMARRÉ\n✅ Zero erreur détectée\n📊 Conditions d'entrée : EMA20 + ATR + Impulsion + Order Book\n⚙️ Conditions de sortie : TP, SL, Partial exit, Trailing SL dynamique, Flash crash\n🔄 Fonctionnel et prêt à analyser")
+
     def connect_exchange(self):
         self.exchange = ccxt.binance({
             'apiKey': os.getenv("BINANCE_API_KEY"),
@@ -51,7 +54,7 @@ class QuantisFinal:
         })
 
     def validate_environment(self):
-        required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]
+        required = ["BINANCE_API_KEY", "BINANCE_API_SECRET", "WUNDERTRADE_WEBHOOK_URL", "DISCORD_WEBHOOK_URL", "WHALE_ALERT_API", "CRYPTOPANIC_API"]
         missing = [var for var in required if not os.getenv(var)]
         if missing:
             raise EnvironmentError(f"❌ Variables manquantes : {missing}")
@@ -120,9 +123,11 @@ class QuantisFinal:
                     # Entrée SHORT
                     elif data_1d['direction'] == "bearish" and data_1d["impulse_short"] and ob_analysis == "sell":
                         self.enter_trade(symbol, data_1d, "SHORT")
+                    else:
+                        self.send_notif(f"🔄 Analyse {symbol} : pas de signal (neutral)")
 
         except Exception as e:
-            print(f"Erreur Loop: {e}")
+            self.send_notif(f"⚠️ Erreur Loop: {e}")
             self.error_count += 1
             if self.error_count > self.max_errors:
                 self.circuit_open = True
@@ -139,6 +144,9 @@ class QuantisFinal:
             account_info = self.exchange.fetch_balance()
             usdt_balance = account_info['USDT']['total']
             capital_to_use = min(usdt_balance, MAX_INVEST)
+            if capital_to_use < 1:  # Eviter entrée si solde quasi nul
+                self.send_notif(f"⚠️ Solde insuffisant pour trader {symbol}")
+                return
 
             self.active_trades[symbol] = {
                 "dir": side,
@@ -150,10 +158,12 @@ class QuantisFinal:
                 "trailing_tp_active": False,
                 "capital": capital_to_use
             }
+
             self.send_to_wunder(symbol, side, entry, tp, sl, atr * 1.5, capital_to_use)
-            self.send_notif(f"🎯 SIGNAL {side} {symbol} | ATR: {round(atr,4)} | Capital utilisé: {capital_to_use}$ | Levier x{LEVERAGE}")
+            self.send_notif(f"🚀 Trade ouvert : {side} {symbol}\n💰 Capital utilisé : ${capital_to_use}\n📌 Prix d'entrée : {entry}\n📈 TP : {tp} | SL : {sl} | TS mult : 1.5\n⚡ Levier : x{LEVERAGE}")
+
         except Exception as e:
-            print(f"Erreur entrée trade {symbol}: {e}")
+            self.send_notif(f"⚠️ Erreur entrée trade {symbol}: {e}")
 
     def manage_active_trade(self, symbol):
         trade = self.active_trades[symbol]
@@ -163,33 +173,31 @@ class QuantisFinal:
         price = data_now['price']
         atr_trail_dist = data_now['atr'] * trade["ts_mult"]
 
+        # Flash crash protection
         if self.check_flash_crash(symbol):
             self.do_exit(symbol, price, "exit", "🚨 FLASH CRASH (3%)")
             return
 
-        # --- Trailing stop dynamique activé après +1% ---
-        pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir']=="LONG" else (trade['entry'] - price) / trade['entry'] * 100
+        # Trailing SL dynamique
+        if trade['dir'] == "LONG":
+            trade["sl"] = max(trade["sl"], price - atr_trail_dist)
+        else:
+            trade["sl"] = min(trade["sl"], price + atr_trail_dist)
 
         # Partial exit +1%
+        pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir']=="LONG" else (trade['entry'] - price) / trade['entry'] * 100
         if pnl >= 1.0 and not trade["partial_done"]:
-            self.send_to_wunder(symbol, "partial_exit", price, trade["tp"], trade["sl"], atr_trail_dist, amount="10%")
+            self.send_to_wunder(symbol, "partial_exit", price, trade["tp"], trade["sl"], atr_trail_dist, trade["capital"], amount="10%")
             trade["sl"] = max(trade["sl"], trade['entry']) if trade['dir']=="LONG" else min(trade["sl"], trade['entry'])
             trade["partial_done"] = True
-            trade["trailing_tp_active"] = True  # Activation du trailing dynamique
-            self.send_notif(f"💰 +1% sécurisé sur {symbol} | Trailing dynamique activé")
+            self.send_notif(f"💰 +1 % atteint sur {symbol}\n🔒 10 % sécurisé\n⚠️ 90 % restant exposé au trade")
 
-        # Si trailing actif, suivre le prix dynamiquement
-        if trade["trailing_tp_active"]:
-            if trade['dir'] == "LONG" and price - atr_trail_dist > trade["sl"]:
-                trade["sl"] = price - atr_trail_dist
-            elif trade['dir'] == "SHORT" and price + atr_trail_dist < trade["sl"]:
-                trade["sl"] = price + atr_trail_dist
-
-        # TP atteint → ajuster trailing distance
+        # TP atteint → activer trailing TP
         tp_reached = (trade['dir']=="LONG" and price >= trade["tp"]) or (trade['dir']=="SHORT" and price <= trade["tp"])
-        if tp_reached:
-            trade["ts_mult"] = 0.5  # Réduire la distance du trailing après TP
-            self.send_notif(f"🚀 TP ATTEINT : Trailing ajusté et continue à suivre le prix")
+        if tp_reached and not trade["trailing_tp_active"]:
+            trade["trailing_tp_active"] = True
+            trade["ts_mult"] = 0.5
+            self.send_notif(f"🚀 TP ATTEINT sur {symbol} : Trailing Profit Activé !")
 
         # Sortie SL/TP
         sl_hit = (trade['dir']=="LONG" and price <= trade["sl"]) or (trade['dir']=="SHORT" and price >= trade["sl"])
@@ -241,7 +249,6 @@ class QuantisFinal:
 
 # --- DÉMARRAGE ---
 quantis = QuantisFinal()
-print(f"🤖 QUANTIS PRO DÉMARRÉ - 12H - EMA 20 - ATR CONDITION - Levier x{LEVERAGE}")
 while True:
     quantis.run_strategy()
     time.sleep(5)
