@@ -167,28 +167,29 @@ class QuantisFinal:
             self.do_exit(symbol, price, "exit", "🚨 FLASH CRASH (3%)")
             return
 
-        # Trailing SL dynamique
-        if trade['dir'] == "LONG":
-            if price - atr_trail_dist > trade["sl"]:
-                trade["sl"] = price - atr_trail_dist
-        else:
-            if price + atr_trail_dist < trade["sl"]:
-                trade["sl"] = price + atr_trail_dist
+        # --- Trailing stop dynamique activé après +1% ---
+        pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir']=="LONG" else (trade['entry'] - price) / trade['entry'] * 100
 
         # Partial exit +1%
-        pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir']=="LONG" else (trade['entry'] - price) / trade['entry'] * 100
         if pnl >= 1.0 and not trade["partial_done"]:
             self.send_to_wunder(symbol, "partial_exit", price, trade["tp"], trade["sl"], atr_trail_dist, amount="10%")
             trade["sl"] = max(trade["sl"], trade['entry']) if trade['dir']=="LONG" else min(trade["sl"], trade['entry'])
             trade["partial_done"] = True
-            self.send_notif(f"💰 +1% sécurisé sur {symbol}")
+            trade["trailing_tp_active"] = True  # Activation du trailing dynamique
+            self.send_notif(f"💰 +1% sécurisé sur {symbol} | Trailing dynamique activé")
 
-        # TP atteint → activer trailing TP
+        # Si trailing actif, suivre le prix dynamiquement
+        if trade["trailing_tp_active"]:
+            if trade['dir'] == "LONG" and price - atr_trail_dist > trade["sl"]:
+                trade["sl"] = price - atr_trail_dist
+            elif trade['dir'] == "SHORT" and price + atr_trail_dist < trade["sl"]:
+                trade["sl"] = price + atr_trail_dist
+
+        # TP atteint → ajuster trailing distance
         tp_reached = (trade['dir']=="LONG" and price >= trade["tp"]) or (trade['dir']=="SHORT" and price <= trade["tp"])
-        if tp_reached and not trade["trailing_tp_active"]:
-            trade["trailing_tp_active"] = True
-            trade["ts_mult"] = 0.5
-            self.send_notif(f"🚀 TP ATTEINT : Trailing Profit Activé !")
+        if tp_reached:
+            trade["ts_mult"] = 0.5  # Réduire la distance du trailing après TP
+            self.send_notif(f"🚀 TP ATTEINT : Trailing ajusté et continue à suivre le prix")
 
         # Sortie SL/TP
         sl_hit = (trade['dir']=="LONG" and price <= trade["sl"]) or (trade['dir']=="SHORT" and price >= trade["sl"])
