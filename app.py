@@ -8,7 +8,7 @@ from datetime import datetime
 import pytz
 
 # ===================== CONFIGURATION QUANTIS PRO =====================
-SYMBOLS = ["ZEC/USDT"] 
+SYMBOLS = ["ZEC/USDT"]
 TIMEZONE = pytz.timezone("Africa/Abidjan")
 START_HOUR = 12  # ✅ 12h comme demandé
 # =====================================================
@@ -34,7 +34,6 @@ class QuantisFinal:
     def __init__(self):
         self.validate_environment()
         self.connect_exchange()
-        
         self.active_trades = {}
         self.cooldowns = {}
         self.error_count = 0
@@ -59,25 +58,26 @@ class QuantisFinal:
     def get_indicators(self, symbol, timeframe='1d'):
         bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
         df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
-        
-        # --- EMA 20 ---
+
         df['ema20'] = df['c'].ewm(span=20, adjust=False).mean()
-        
         df['tr'] = df[['h','l','c']].apply(lambda x: max(x.iloc[0]-x.iloc[1], abs(x.iloc[0]-x.iloc[2]), abs(x.iloc[1]-x.iloc[2])), axis=1)
         df['atr'] = df['tr'].rolling(14).mean()
-        
-        impulse = df['c'].iloc[-1] > df['c'].iloc[-2] and df['v'].iloc[-1] > df['v'].iloc[-2]
+
+        # Impulsion pour LONG et SHORT
+        impulse_long = df['c'].iloc[-1] > df['c'].iloc[-2] and df['v'].iloc[-1] > df['v'].iloc[-2]
+        impulse_short = df['c'].iloc[-1] < df['c'].iloc[-2] and df['v'].iloc[-1] > df['v'].iloc[-2]
+
         direction = "bullish" if df['c'].iloc[-1] > df['ema20'].iloc[-1] else "bearish"
-        
+
         return {
             "price": df['c'].iloc[-1],
             "ema20": df['ema20'].iloc[-1],
             "atr": df['atr'].iloc[-1],
-            "impulse": impulse,
+            "impulse_long": impulse_long,
+            "impulse_short": impulse_short,
             "direction": direction
         }
 
-    # --- SÉCURITÉ FLASH CRASH (RÉGLÉ À 3% POUR ZEC) ---
     @retry_api
     def check_flash_crash(self, symbol):
         bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=2)
@@ -85,7 +85,6 @@ class QuantisFinal:
         last_open = bars[-1][1]
         current_price = bars[-1][4]
         change = (current_price - last_open) / last_open * 100
-        
         direction = self.active_trades[symbol]['dir']
         if (direction == "LONG" and change <= -3.0) or (direction == "SHORT" and change >= 3.0):
             return True
@@ -96,11 +95,11 @@ class QuantisFinal:
             time.sleep(300)
             self.circuit_open = False
             return
-            
+
         try:
             now_civ = datetime.now(TIMEZONE)
-            
-            # --- FERMETURE FIN DE JOURNÉE (23h59) ---
+
+            # Fermeture fin de journée
             if now_civ.hour == 23 and now_civ.minute == 59:
                 for symbol in list(self.active_trades.keys()):
                     self.do_exit(symbol, self.active_trades[symbol]['entry'], "exit", "⏰ FERMETURE 23H59")
@@ -116,14 +115,19 @@ class QuantisFinal:
                 if symbol in self.cooldowns and (time.time() - self.cooldowns[symbol] < 300): continue
 
                 data_1d = self.get_indicators(symbol, '1d')
-                
-                if data_1d and data_1d["impulse"] and data_1d["atr"] > 0:
+
+                # LONG
+                if data_1d and data_1d["impulse_long"] and data_1d['direction']=="bullish":
                     ob_analysis = self.analyze_order_book(symbol)
-                    if data_1d['direction'] == "bullish" and ob_analysis == "buy":
+                    if ob_analysis == "buy":
                         self.enter_trade(symbol, data_1d, "LONG")
-                    elif data_1d['direction'] == "bearish" and ob_analysis == "sell":
+
+                # SHORT
+                if data_1d and data_1d["impulse_short"] and data_1d['direction']=="bearish":
+                    ob_analysis = self.analyze_order_book(symbol)
+                    if ob_analysis == "sell":
                         self.enter_trade(symbol, data_1d, "SHORT")
-                    
+
         except Exception as e:
             print(f"Erreur Loop: {e}")
             self.error_count += 1
@@ -137,48 +141,55 @@ class QuantisFinal:
             atr = data['atr']
             tp = entry + (atr * 2.0) if side == "LONG" else entry - (atr * 2.0)
             sl = entry - (atr * 1.5) if side == "LONG" else entry + (atr * 1.5)
-            
+
             self.active_trades[symbol] = {
-                "dir": side, "entry": entry, "tp": tp, "sl": sl, 
-                "ts_mult": 1.5, "partial_done": False, "trailing_tp_active": False
+                "dir": side,
+                "entry": entry,
+                "tp": tp,
+                "sl": sl,
+                "ts_mult": 1.5,
+                "partial_done": False,
+                "trailing_tp_active": False
             }
             self.send_to_wunder(symbol, side, entry, tp, sl, atr * 1.5)
-            self.send_notif(f"🎯 SIGNAL {side} {symbol} | ATR: {round(atr, 4)}")
+            self.send_notif(f"🎯 SIGNAL {side} {symbol} | ATR: {round(atr,4)}")
         except: pass
 
     def manage_active_trade(self, symbol):
         trade = self.active_trades[symbol]
         data_now = self.get_indicators(symbol, '1d')
         if not data_now: return
-        
         price = data_now['price']
         atr_trail_dist = data_now['atr'] * trade["ts_mult"]
 
+        # Flash crash
         if self.check_flash_crash(symbol):
             self.do_exit(symbol, price, "exit", "🚨 FLASH CRASH (3%)")
             return
 
-        if trade['dir'] == "LONG":
-            if price - atr_trail_dist > trade["sl"]: trade["sl"] = price - atr_trail_dist
+        # Trailing Stop sur 1D
+        if trade['dir']=="LONG":
+            trade["sl"] = max(trade["sl"], price - atr_trail_dist)
         else:
-            if price + atr_trail_dist < trade["sl"]: trade["sl"] = price + atr_trail_dist
+            trade["sl"] = min(trade["sl"], price + atr_trail_dist)
 
-        pnl = (price - trade['entry']) / trade['entry'] * 100 if trade['dir']=="LONG" else (trade['entry'] - price) / trade['entry'] * 100
+        # Partial exit + sécurisation +1%
+        pnl = (price - trade['entry'])/trade['entry']*100 if trade['dir']=="LONG" else (trade['entry'] - price)/trade['entry']*100
         if pnl >= 1.0 and not trade["partial_done"]:
             self.send_to_wunder(symbol, "partial_exit", price, trade["tp"], trade["sl"], atr_trail_dist, amount="10%")
-            if trade['dir'] == "LONG": trade["sl"] = max(trade["sl"], trade['entry'])
-            else: trade["sl"] = min(trade["sl"], trade['entry'])
+            trade["sl"] = max(trade["sl"], trade['entry']) if trade['dir']=="LONG" else min(trade["sl"], trade['entry'])
             trade["partial_done"] = True
             self.send_notif(f"💰 +1% sécurisé sur {symbol}")
 
+        # TP atteint → trailing profit activé
         tp_reached = (trade['dir']=="LONG" and price >= trade["tp"]) or (trade['dir']=="SHORT" and price <= trade["tp"])
         if tp_reached and not trade["trailing_tp_active"]:
             trade["trailing_tp_active"] = True
-            trade["ts_mult"] = 0.5 
+            trade["ts_mult"] = 0.5
             self.send_notif(f"🚀 TP ATTEINT : Trailing Profit Activé !")
 
+        # SL touché
         sl_hit = (trade['dir']=="LONG" and price <= trade["sl"]) or (trade['dir']=="SHORT" and price >= trade["sl"])
-        
         if sl_hit:
             reason = "🛡️ TRAILING SL/TP TOUCHÉ"
             self.do_exit(symbol, price, "exit", reason)
@@ -193,7 +204,6 @@ class QuantisFinal:
     @retry_api
     def analyze_order_book(self, symbol):
         ob = self.exchange.fetch_order_book(symbol)
-        # Correction 2 : On passe à un ratio de 1.5 et on analyse le Top 20
         bids, asks = sum(b[1] for b in ob['bids'][:20]), sum(a[1] for a in ob['asks'][:20])
         return "buy" if bids > asks * 1.5 else "sell" if asks > bids * 1.5 else "neutral"
 
@@ -228,5 +238,4 @@ quantis = QuantisFinal()
 print("🤖 QUANTIS PRO DÉMARRÉ - 12H - EMA 20 - ATR CONDITION")
 while True:
     quantis.run_strategy()
-    # Correction 1 : On réduit le temps de pause à 5 secondes pour plus de réactivité
     time.sleep(5)
